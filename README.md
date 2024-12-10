@@ -48,6 +48,7 @@ If you get any problems, please raise an [issue](https://github.com/yeeus/GCI/is
   - 
 
 - faster IO? using other method to read or write VCF files? [PyVCF](https://github.com/jamescasbon/PyVCF)
+  - I will use `pysam` to edit vcf records more efficiently. (quanyu)
 
 - Add some modules for statistics or visualization
   - basic statistics
