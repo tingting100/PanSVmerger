@@ -221,13 +221,14 @@ def update_genotypes_and_ac(variant, clusters):
 
     # Calculate AF values
     an = sum(1 for genotype in genotypes if genotype != '.')
-    # Update INFO field with new AN value
+    # Update INFO field with new AN and NS value
     an_updated = False
     for i, field in enumerate(updated_info_fields):
         if field.startswith('AN='):
             updated_info_fields[i] = f'AN={an}'
             an_updated = True
-            break
+        elif field.startswith('NS='):
+            updated_info_fields[i] = f'NS={an}'
     if not an_updated:
         updated_info_fields.append(f'AN={an}')
 
@@ -242,6 +243,13 @@ def update_genotypes_and_ac(variant, clusters):
             break
     if not af_updated:
         updated_info_fields.append('AF=' + ','.join(af_values))
+
+    # Update INFO field with new AT values
+    for i, field in enumerate(updated_info_fields):
+        if field.startswith('AT='):
+            at_values = updated_info_fields[i].split(',')[:len(new_alts)]
+            updated_info_fields[i] = ','.join(at_values)
+            break
     
     updated_info = ';'.join(updated_info_fields)
     
