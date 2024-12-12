@@ -62,12 +62,14 @@ If you get any problems, please raise an [issue](https://github.com/tingting100/
 
 - consider make most of parameters accessible, such as 
   - length threshold for grouping or make is as an dynamic setting which depends on allele length; 
-  - the vsearch path, the main parameters of vsearch, like threads, cluster mode, 
+  - the vsearch path, the main parameters of vsearch, like threads, cluster mode,
+    - (paritally) done (quanyu)
   - for clustering very long or large sequences, consider to use [HAlign](https://github.com/malabz/HAlign-3)
   - 
 
 - faster IO? using other method to read or write VCF files? [PyVCF](https://github.com/jamescasbon/PyVCF)
   - I will use `pysam` to edit vcf records more efficiently. (quanyu)
+    - done
 
 - Add some modules for statistics or visualization
   - basic statistics
