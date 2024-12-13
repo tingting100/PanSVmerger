@@ -226,7 +226,7 @@ def update_record(rec, clusters, vcf_header, vcf_out):
     # Update INFO field with new AC, AF values
     new_info['AC'] = tuple([ac_counts[i] for i in range(1, len(new_alts) + 1)])
     new_info['AF'] = tuple([ac_counts[i] / new_info['AN'] for i in range(1, len(new_alts) + 1)])
-    new_info['AT'] = new_info['AT'][:len(new_alts)] ## simply extract the first `len(new_alts)` allele traversals
+    new_info['AT'] = new_info['AT'][:len(new_alts) + 1] ## simply extract the first `len(new_alts) + 1` allele traversals
     
     new_rec = vcf_header.new_record(contig=rec.chrom, start=rec.start, stop=rec.stop, alleles=[rec.ref] + new_alts, id=rec.id, qual=rec.qual, filter=rec.filter, info=new_info)
     vcf_out.write(new_rec)
