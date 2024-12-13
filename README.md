@@ -41,6 +41,9 @@ bcftools index -t --threads 16 MC.wave.bi.createmulti.merge.vcf.gz
 ## Output
 
 
+## some useful tools
+### convert between phased diploid vcf and haploid vcf
+
 
 ## Citation
 
