@@ -1,0 +1,12 @@
+## cd ./assembly-based.SV
+##SVIM-asm
+～/bin/minimap2/2.17/minimap2  -a -x asm5 --cs -r2k -t 4 genome.fa query.fa  > alignments.sam
+~/bin/samtools sort -m4G -@4 -o  alignments.sorted.bam alignments.sam
+~/bin/samtools index alignments.sorted.bam
+~/bin/svim-asm  diploid ./ alignments.sorted.bam genome.fa
+
+##SyRI
+~/bin/mummer-4.0.0/bin/nucmer --prefix=sample -l 100 genome.fa query.fa
+~/bin/mummer-4.0.0/delta-filter  -l 100 -i 90 -1   sample.delta >sample.delta.filter
+~/bin/mummer-4.0.0/bin/show-coords -THrd sample.delta.filter >sample.filtered.coords
+python3 ~bin/syri-1.5/syri/bin/syri -c sample.filtered.coords -r genome.fa  -q query.fa -d sample.delta.filter -k --prefix  sample -s ~/bin/show-snps --lf  syri.log
