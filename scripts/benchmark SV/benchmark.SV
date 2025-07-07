@@ -9,10 +9,7 @@ vcfbub -l 0 -a 100000 -i sampleN.vcf.gz -o sampleN.filtered.vcf.gz
 vcfwave -I 1000 -i sampleN.filtered.vcf.gz -o sampleN.wave.vcf.gz
 
 # 04_split_biallelic.sh
-bcftools norm -m -any -isampleN.wave.vcf.gz -o sampleN.biallelic.vcf.gz
+bcftools norm -m -any -i sampleN.wave.vcf.gz -o sampleN.biallelic.vcf.gz
 
-# 05_run_vcfeval.sh
-vcfeval -b sampleN.truth.snp_indel.vcf.gz -c sampleN.biallelic.vcf.gz -o vcfeval_results
-
-# 06_run_truvari.sh
+# 05_run_truvari.sh
 truvari bench -b sampleN.truth.sv.vcf.gz -c sampleN.biallelic.vcf.gz -o truvari_results
