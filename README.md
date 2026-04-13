@@ -1,9 +1,9 @@
 # PanSVmerger: A Pipeline for Consolidating Multi-Allele Structural Variants
 
 ## 📖 Introduction
-**PanSVMerger** is a high-performance bioinformatics pipeline designed to refine and merge structural variant (SV) calls derived from pangenome graphs (e.g., Minigraph-Cactus). 
+**PanSVmerger** is a high-performance bioinformatics pipeline designed to refine and merge structural variant (SV) calls derived from pangenome graphs (e.g., Minigraph-Cactus). 
 
-Structural variants extracted from graph bubbles often contain redundant, nested, or slightly divergent alleles due to sequencing errors, alignment artifacts, or graph complexity. PanSVMerger addresses these challenges by implementing a three-stage workflow: **Decomposition**, **Biological Region Filtering**, and **Intelligent Allele Clustering**. It aims to provide a clean, non-redundant consensus VCF suitable for downstream population genetics and comparative genomics.
+Structural variants extracted from graph bubbles often contain redundant, nested, or slightly divergent alleles due to sequencing errors, alignment artifacts, or graph complexity. PanSVmerger addresses these challenges by implementing a three-stage workflow: **Decomposition**, **Biological Region Filtering**, and **Intelligent Allele Clustering**. It aims to provide a clean, non-redundant consensus VCF suitable for downstream population genetics and comparative genomics.
 
 ---
 
@@ -50,19 +50,20 @@ python bin/filter_tr_region.py \
 ```
 
 ### Step 3: Multi-Allele Clustering
-PanSVMerger offers three distinct strategies to merge redundant alleles at the same locus into representative consensus alleles.
+PanSVmerger offers three complementary clustering strategies to merge redundant alleles at the same locus into representative consensus alleles.
 
-#### Strategy A: Weighted Joint Clustering (Recommended)
+#### Strategy A: K-mer-based adaptive clustering (Jaccard method)
+
 **Script:** `SV.weighted_joint_clustering.py`  
 This strategy utilizes a hybrid distance matrix combining **K-mer frequency (Jaccard Distance)** and **Normalized Length Differences**. It uses DBSCAN to identify clusters and select a representative allele for each.
 *   **Use Case:** Default choice for general pangenome analysis; balances sequence composition and variant size.
 
-#### Strategy B: Sequence Similarity (Global Alignment)
+#### Strategy B: Global alignment-based clustering (Vsearch method)
 **Script:** `SV.sequence.similarity.py`  
 Leverages **VSEARCH** to perform global alignment between all alleles at a locus. Alleles are merged if they meet a specific identity threshold (e.g., 90%).
 *   **Use Case:** When high-resolution nucleotide identity is critical.
 
-#### Strategy C: Length Distribution
+#### Strategy C: Length distribution-based clustering (Length method)
 **Script:** `SV.length.similarity.py`  
 A rapid approach focusing solely on the **Length Distribution** of alleles using DBSCAN.
 *   **Use Case:** Rapid processing of massive datasets where sequence composition is less important than SV size.
@@ -71,7 +72,7 @@ A rapid approach focusing solely on the **Length Distribution** of alleles using
 
 ## 📊 Strategy Comparison
 
-| Feature | Strategy A: Weighted Joint | Strategy B: Sequence | Strategy C: Length-Based |
+| Feature | Strategy A | Strategy B | Strategy C |
 | :--- | :--- | :--- | :--- |
 | **Primary Metric** | K-mer Count + $\Delta$ Length | Global Sequence % Identity | $\Delta$ Length (1D) |
 | **Algorithm** | DBSCAN | VSEARCH | DBSCAN |
@@ -105,8 +106,8 @@ PanSVMerger/
 ---
 
 ## 🤝 Contact & Citation
-If you use PanSVMerger in your research, please cite:
-> *Xxx, et al. (2025). PanSVMerger: A pipeline for structural variant consolidation in pangenome graphs.*
+If you use PanSVmerger in your research, please cite:
+> *Xxx, et al. (2025). PanSVmerger: A pipeline for structural variant consolidation in pangenome graphs.*
 
 **Support:**
 For questions or bug reports, please open an [issue](https://github.com/tingting100/PanSVMerger/issues) or contact:
