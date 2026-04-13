@@ -1,4 +1,4 @@
-# PanSVMerger: A Pipeline for Consolidating Multi-Allele Structural Variants
+# PanSVmerger: A Pipeline for Consolidating Multi-Allele Structural Variants
 
 ## 📖 Introduction
 **PanSVMerger** is a high-performance bioinformatics pipeline designed to refine and merge structural variant (SV) calls derived from pangenome graphs (e.g., Minigraph-Cactus). 
