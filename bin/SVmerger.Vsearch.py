@@ -1,344 +1,529 @@
-import os
-import argparse
-from collections import Counter
-import shutil
-import gzip
-import re
-## allele length ==1 not included: vsearch_path} --cluster_fast {input_fasta} --id {identity} --strand both --uc {output_prefix}.uc --threads 4 --maxseqlength 100000 --minseqlength 2
+#!/usr/bin/env python3
+"""
+PanSVmerger - VSEARCH‑based clustering with length‑based sub‑clustering for multiallelic SVs
 
+Usage:
+    python vsearch_clustering.py --input_vcf input.vcf.gz --output_vcf output.vcf [options]
+
+This script runs VSEARCH cluster_fast on all alleles at each locus, then further splits
+clusters if sequence lengths differ by >10% (or user-defined threshold).
+"""
+
+import os
+import sys
+import argparse
+import gzip
+import tempfile
+import shutil
+import subprocess
+from collections import Counter, defaultdict
+
+# --------------------------- Path detection ---------------------------
+VSEARCH_PATH = "/public/share/ruanjue/yangting/software/vsearch-2.26.1-linux-x86_64/bin/vsearch"
+if not VSEARCH_PATH:
+    sys.stderr.write("Warning: 'vsearch' not found in PATH. Set VSEARCH_PATH environment variable.\n")
+    VSEARCH_PATH = 'vsearch'  # fallback
+
+
+# --------------------------- I/O functions ---------------------------
 def read_vcf(vcf_file):
-    # Reads a VCF file and extracts variant information
+    """Read VCF, return variants and header."""
     variants = []
     header = []
-    if vcf_file.endswith('.gz'):
-        open_func = gzip.open
-        mode = 'rt'
-    else:
-        open_func = open
-        mode = 'r'
-    #with gzip.open(vcf_file, 'rt') as file:
-    with open_func(vcf_file, mode) as file:
-        for line in file:
+    open_func = gzip.open if vcf_file.endswith('.gz') else open
+    mode = 'rt' if vcf_file.endswith('.gz') else 'r'
+    with open_func(vcf_file, mode) as f:
+        for line in f:
             if line.startswith('##'):
                 header.append(line.strip().split('\t'))
-                continue
-            if line.startswith('#CHROM'):
+            elif line.startswith('#CHROM'):
                 header.append(line.strip().split('\t'))
-                continue
-            fields = line.strip().split('\t')
-            chrom, pos, id, ref, info, format_field = fields[0], int(fields[1]), fields[2], fields[3], fields[7], fields[8]
-            alts = fields[4].split(',')
-            genotypes = fields[9:]
-            variants.append((chrom, pos, id, ref, alts, info, format_field, genotypes))
-    return variants, header
-
-def write_tmp_fasta(chrom, pos, ref, alts, output_fasta):
-    with open(output_fasta, 'w') as file:
-        file.write(f">{chrom}-{pos}-ref\n{ref}\n")
-        for j, alt in enumerate(alts):
-            file.write(f">{chrom}-{pos}-alt{j+1}\n{alt}\n")
-
-def run_vsearch(input_fasta, output_prefix, threads, identity=0.9):
-    vsearch_path = "/share/home/zhanglab/user/yangting/software/vsearch/bin/vsearch"
-    command = f"{vsearch_path} --cluster_fast {input_fasta} --id {identity}  --strand both --uc {output_prefix}.uc --threads {threads} --maxseqlength 100000 --minseqlength 1"
-    print(f"Running command: {command}")
-    os.system(command)
-
-
-def parse_vsearch_clusters(uc_file):
-    clusters = {}
-    insufficient_fields_lines = []
-
-    # Read the .uc file and parse clusters
-    with open(uc_file, 'r') as file:
-        for line in file:
-            if line.startswith('S') or line.startswith('H'):
-                fields = line.strip().split('\t')
-                if len(fields) < 9:
-                    insufficient_fields_lines.append(line.strip())
-                    continue
-
-                try:
-                    cluster_id = int(fields[1])
-                    length = int(fields[2])
-                    seq_id = fields[8]
-
-                    # Check if this sequence is the reference
-                    is_ref = '-ref' in seq_id
-
-                    chrom, pos, alt_id = seq_id.split('-')
-                    pos = int(pos)
-                    alt_id = int(alt_id.replace("alt", "")) if "alt" in alt_id else 0
-
-                    if (chrom, pos) not in clusters:
-                        clusters[(chrom, pos)] = {}
-
-                    if cluster_id not in clusters[(chrom, pos)]:
-                        clusters[(chrom, pos)][cluster_id] = []
-
-                    # Add the sequence info to the cluster, marking if it's a reference
-                    clusters[(chrom, pos)][cluster_id].append((alt_id, length, is_ref))
-                except (ValueError, IndexError) as e:
-                    insufficient_fields_lines.append(line.strip())
-                    continue
-
-    # Step 1: Sort sequences in clusters by length and assign new sub-cluster IDs
-    new_clusters = {}
-    max_cluster_id = 0
-
-    for (chrom, pos), cluster_dict in clusters.items():
-        new_clusters[(chrom, pos)] = {}
-        ref_cluster_id = None
-        previous_length = None
-
-        for cluster_id, seqs in cluster_dict.items():
-            seqs.sort(key=lambda x: x[1], reverse=True)
-            current_cluster_id = max_cluster_id
-            for i, (alt_id, length, is_ref) in enumerate(seqs):
-                if i == 0:
-                    new_clusters[(chrom, pos)][alt_id] = current_cluster_id
-                    previous_length = length
-                    longest_alt_id = alt_id 
-                else:
-                    #if previous_length - length > 50:
-                    if previous_length - length > 0.1 * previous_length:
-                        current_cluster_id += 1
-                    new_clusters[(chrom, pos)][alt_id] = current_cluster_id
-                    previous_length = length
-                if is_ref:
-                    ref_cluster_id = current_cluster_id
-                    ref_alt_id = alt_id
-
-            max_cluster_id = current_cluster_id + 1
-
-        # Step 2: Set the reference cluster_id to 0 and adjust other cluster IDs
-        if ref_cluster_id is not None:
-            for alt_id in new_clusters[(chrom, pos)]:
-                if new_clusters[(chrom, pos)][alt_id] == ref_cluster_id:
-                    new_clusters[(chrom, pos)][alt_id] = 0
-            
-            cluster_id_mapping = {}
-            new_cluster_id = 1
-            for alt_id in sorted(new_clusters[(chrom, pos)]):
-                old_cluster_id = new_clusters[(chrom, pos)][alt_id]
-                if old_cluster_id != 0:
-                    if old_cluster_id not in cluster_id_mapping:
-                        cluster_id_mapping[old_cluster_id] = new_cluster_id
-                        new_cluster_id += 1
-                    new_clusters[(chrom, pos)][alt_id] = cluster_id_mapping[old_cluster_id]
-        else:
-            # 如果 ref_cluster_id 为空，则所有的 alt_id 的 cluster_id 都加1
-            for alt_id in new_clusters[(chrom, pos)]:
-                new_clusters[(chrom, pos)][alt_id] += 1
-            new_clusters[(chrom, pos)][0] = 0  # 将 cluster_id 为0 的位置留给参考等位基因
-
-    return new_clusters,insufficient_fields_lines
-
-def ensure_ref_and_alts_in_clusters(variant, clusters):
-    chrom, pos, id, ref, alts, info, format_field, genotypes = variant
-    
-    # Initialize cluster dictionary for the variant's position if it doesn't exist
-    if (chrom, pos) not in clusters:
-        clusters[(chrom, pos)] = {}
-    
-    # Ensure the reference sequence (ID = 0) is in the cluster
-    if 0 not in clusters[(chrom, pos)]:
-        clusters[(chrom, pos)][0] = 0  # Add reference sequence with cluster ID 0
-
-    # Add alternative alleles and ensure they have unique IDs
-    for i in range(1, len(alts) + 1):
-        if i not in clusters[(chrom, pos)]:
-            # Assign a new cluster ID ensuring uniqueness
-            clusters[(chrom, pos)][i] = max(clusters[(chrom, pos)].values(), default=0) + 1
-    
-    return clusters
-
-def update_genotypes_and_ac(variant, clusters):
-    chrom, pos, id, ref, alts, info, format_field, genotypes = variant
-    clusters = ensure_ref_and_alts_in_clusters(variant, clusters)
-    cluster_mapping = clusters[(chrom, pos)]
-
-    # Debug information: print cluster mapping
-    print(f"Cluster mapping for {chrom}-{pos}: {cluster_mapping}")
-
-    new_genotypes = []
-    ac_counts = Counter()
-
-    # Find the reference sequence's cluster ID
-    ref_cluster_id = cluster_mapping[0]
-    
-    # Redefine genotypes based on clusters
-    cluster_to_genotype = {ref_cluster_id: 0}
-    next_genotype = 1
-
-    for cluster_id in sorted(set(cluster_mapping.values())):
-        if cluster_id != ref_cluster_id:
-            cluster_to_genotype[cluster_id] = next_genotype
-            next_genotype += 1
-
-    for genotype in genotypes:
-        if genotype == '.':
-            new_genotype = genotype
-        else:
-            original_genotype = int(genotype)
-            if original_genotype in cluster_mapping:
-                new_genotype = str(cluster_to_genotype[cluster_mapping[original_genotype]])
-                if cluster_mapping[original_genotype] != ref_cluster_id:
-                    ac_counts[int(new_genotype)] += 1
             else:
-                # Handle singleton sequences
-                new_genotype = str(next_genotype)
-                next_genotype += 1
-                ac_counts[int(new_genotype)] += 1
-        new_genotypes.append(new_genotype)
-
-    # Update ALT sequences: take the longest sequence from each cluster
-    new_alts = []
-    cluster_to_alt = {cluster_id: [] for cluster_id in sorted(cluster_to_genotype.keys())}
-
-    for alt_id, cluster_id in cluster_mapping.items():
-        if cluster_id != ref_cluster_id:
-            # Store alternative alleles based on their cluster ID
-            cluster_to_alt[cluster_id].append(alts[alt_id - 1] if alt_id - 1 < len(alts) else ref)
-
-    # Select the longest sequence for each alternative cluster
-    for cluster_id in sorted(cluster_to_genotype.keys()):
-        if cluster_id != ref_cluster_id:
-            longest_alt = max(cluster_to_alt[cluster_id], key=len, default=ref)
-            new_alts.append(longest_alt)
-    # 如果 new_alts 为空，直接返回原始 variant
-    if not new_alts:
-        return variant
-
-    # Update INFO field with new AC values
-    ac_values = [str(ac_counts[i]) for i in range(1, len(new_alts) + 1)]
-    info_fields = info.split(';')
-    updated_info_fields = []
-    for field in info_fields:
-        if field.startswith('AC='):
-            updated_info_fields.append('AC=' + ','.join(ac_values))
-        else:
-            updated_info_fields.append(field)
-
-    # Calculate AF values
-    an = sum(1 for genotype in genotypes if genotype != '.')
-    # Update INFO field with new AN value
-    an_updated = False
-    for i, field in enumerate(updated_info_fields):
-        if field.startswith('AN='):
-            updated_info_fields[i] = f'AN={an}'
-            an_updated = True
-            break
-    if not an_updated:
-        updated_info_fields.append(f'AN={an}')
-
-    af_values = [f"{ac_counts[i] / an:.6f}" for i in range(1, len(new_alts) + 1)]
- 
-    # Update INFO field with new AF values
-    af_updated = False
-    for i, field in enumerate(updated_info_fields):
-        if field.startswith('AF='):
-            updated_info_fields[i] = 'AF=' + ','.join(af_values)
-            af_updated = True
-            break
-    if not af_updated:
-        updated_info_fields.append('AF=' + ','.join(af_values))
-    
-    updated_info = ';'.join(updated_info_fields)
-    
-    return (chrom, pos, id, ref, new_alts, updated_info, format_field, new_genotypes)    
+                fields = line.strip().split('\t')
+                chrom, pos, vid = fields[0], int(fields[1]), fields[2]
+                ref = fields[3]
+                alts = fields[4].split(',') if fields[4] != '.' else []
+                info = fields[7]
+                fmt = fields[8]
+                genotypes = fields[9:]
+                variants.append((chrom, pos, vid, ref, alts, info, fmt, genotypes))
+    return variants, header
 
 
 def write_vcf_header(output_file, header):
-    with open(output_file, 'w') as file:
-        for i in header:
-            file.write("\t".join(i) + "\n")
+    with open(output_file, 'w') as f:
+        for parts in header:
+            f.write("\t".join(parts) + "\n")
+
 
 def write_vcf_variant(output_file, variant):
-    with open(output_file, 'a') as file:
-        chrom, pos, id, ref, alts, info, format_field, genotypes = variant
-        file.write("{}\t{}\t{}\t{}\t{}\t.\t.\t{}\t{}\t{}\n".format(
-            chrom, pos, id, ref, ",".join(alts), info, format_field, "\t".join(genotypes)))
+    chrom, pos, vid, ref, alts, info, fmt, genotypes = variant
+    with open(output_file, 'a') as f:
+        f.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{','.join(alts)}\t.\t.\t{info}\t{fmt}\t"
+                + "\t".join(genotypes) + "\n")
 
-def save_insufficient_fields_lines(insufficient_fields_lines, output_file):
-    with open(output_file, 'w') as file:
-        for line in insufficient_fields_lines:
-            file.write(line + '\n')
-
-def append_uc_to_merged(uc_file, merged_uc_file, lines_to_append, first_write=False):
-    # 如果是第一次写入，清空文件内容
-    if first_write:
-        with open(merged_uc_file, 'w') as outfile:
-            outfile.write('')
-
-    # 以追加模式打开 merged_uc_file 并写入内容
-    with open(merged_uc_file, 'a') as outfile:
-        for line in lines_to_append:
-            if line.strip():  # 避免追加空行
-                outfile.write(line + '\n')
 
 def save_cluster_mapping(cluster_mapping, output_file):
-    # Save the cluster mapping to a file
-    with open(output_file, 'a') as file:
+    """Save (chrom,pos) -> alt_id -> cluster_id mapping."""
+    with open(output_file, 'w') as f:
         for (chrom, pos), alt_dict in sorted(cluster_mapping.items()):
             for alt_id, cluster_id in alt_dict.items():
-                file.write(f"{chrom}\t{pos}\t{alt_id}\t{cluster_id}\n")
+                f.write(f"{chrom}\t{pos}\t{alt_id}\t{cluster_id}\n")
 
-def main(input_vcf, output_vcf, tmp_fasta, cluster_prefix, merged_uc_file, new_cluster_file,insufficient_fields_file, threads):
-    variants, header = read_vcf(input_vcf)
-    write_vcf_header(output_vcf, header)
-    first_write = True  # 标记是否是第一次写入 merged_uc_file
- 
-    for variant in variants:
-        chrom, pos, id, ref, alts, info, format_field, genotypes = variant
-        if len(alts) == 1:
-            # 直接输出
-            write_vcf_variant(output_vcf, variant)
+
+# --------------------------- Genotype helper ---------------------------
+def split_genotype(gt_str, ploidy):
+    """
+    Parse genotype string according to ploidy.
+    Returns list of allele indices or None if missing.
+    """
+    if gt_str in ('.', './.', '.|.'):
+        return None
+    if ploidy == 1:
+        if gt_str == '.':
+            return None
+        try:
+            return [int(gt_str)]
+        except ValueError:
+            return None
+    else:
+        if '/' in gt_str:
+            parts = gt_str.split('/')
+        elif '|' in gt_str:
+            parts = gt_str.split('|')
         else:
-#            long_alts = [alt for alt in alts if len(alt) > 50000]
-#            if len(long_alts) > 100:
-#                # 直接输出原始变异信息
-#                write_vcf_variant(output_vcf, variant)
-#                continue
+            if gt_str == '.':
+                return None
+            try:
+                val = int(gt_str)
+                return [val, val]
+            except ValueError:
+                return None
+        alleles = []
+        for p in parts:
+            if p == '.':
+                alleles.append(None)
+            else:
+                try:
+                    alleles.append(int(p))
+                except ValueError:
+                    alleles.append(None)
+        return alleles
 
-            write_tmp_fasta(chrom, pos, ref, alts, tmp_fasta)
-            run_vsearch(tmp_fasta, cluster_prefix, threads)
-            
-            # Parse VSEARCH output to get clusters
-            initial_clusters,insufficient_fields_lines = parse_vsearch_clusters(f"{cluster_prefix}.uc")
-            # 如果没有聚类信息，直接输出原始变异信息
-            if (chrom, pos) not in initial_clusters:
-                write_vcf_variant(output_vcf, variant)
+
+# --------------------------- VSEARCH clustering core ---------------------------
+def write_locus_fasta(chrom, pos, ref, alts, fasta_path):
+    """Write REF and ALT sequences to FASTA file."""
+    with open(fasta_path, 'w') as f:
+        f.write(f">{chrom}-{pos}-ref\n{ref}\n")
+        for j, alt in enumerate(alts, 1):
+            f.write(f">{chrom}-{pos}-alt{j}\n{alt}\n")
+
+
+def run_vsearch(input_fasta, output_uc, threads, identity):
+    """Run VSEARCH cluster_fast, return True if successful."""
+    cmd = [
+        VSEARCH_PATH,
+        "--cluster_fast", input_fasta,
+        "--id", str(identity),
+        "--strand", "both",
+        "--uc", output_uc,
+        "--threads", str(threads),
+        "--maxseqlength", "100000",
+        "--minseqlength", "1"   # can be made configurable if needed
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        sys.stderr.write(f"VSEARCH error: {e.stderr}\n")
+        return False
+
+
+def parse_vsearch_uc(uc_file):
+    """
+    Parse UC file, return clusters dict:
+        (chrom,pos) -> cluster_id -> list of (alt_id, length, is_ref)
+    """
+    clusters = defaultdict(lambda: defaultdict(list))
+    if not os.path.exists(uc_file) or os.path.getsize(uc_file) == 0:
+        return clusters
+
+    with open(uc_file, 'r') as f:
+        for line in f:
+            if not line.startswith(('S', 'H')):
+                continue
+            fields = line.strip().split('\t')
+            if len(fields) < 9:
+                continue
+            try:
+                cluster_id = int(fields[1])
+                length = int(fields[2])
+                seq_id = fields[8]
+                # seq_id format: chrom-pos-ref or chrom-pos-altN
+                parts = seq_id.split('-')
+                if len(parts) < 3:
+                    continue
+                chrom = parts[0]
+                pos = int(parts[1])
+                # last part
+                last = parts[-1]
+                if last == 'ref':
+                    alt_id = 0
+                    is_ref = True
+                elif last.startswith('alt'):
+                    alt_id = int(last.replace('alt', ''))
+                    is_ref = False
+                else:
+                    continue
+                clusters[(chrom, pos)][cluster_id].append((alt_id, length, is_ref))
+            except (ValueError, IndexError):
+                continue
+    return clusters
+
+
+def refine_clusters_by_length(clusters, length_cut=0.1):
+    """
+    For each VSEARCH cluster, further split if length difference > length_cut * previous_length.
+    Returns new cluster mapping: (chrom,pos) -> alt_id -> cluster_id
+    """
+    new_clusters = {}
+    for (chrom, pos), cluster_dict in clusters.items():
+        # Gather all sequences with their cluster_id
+        seq_info = []  # (alt_id, length, is_ref, original_cluster_id)
+        for cid, seqs in cluster_dict.items():
+            for alt_id, length, is_ref in seqs:
+                seq_info.append((alt_id, length, is_ref, cid))
+
+        # Sort by original cluster id, then by length descending
+        seq_info.sort(key=lambda x: (x[3], -x[1]))
+
+        # Assign new cluster IDs
+        new_cluster_id = 0
+        ref_new_cluster = None
+        mapping = {}  # alt_id -> new_cluster_id
+
+        # Process each original cluster separately
+        current_orig_cid = None
+        for alt_id, length, is_ref, orig_cid in seq_info:
+            if orig_cid != current_orig_cid:
+                # new original cluster
+                current_orig_cid = orig_cid
+                # start a new new-cluster
+                new_cluster_id += 1  # will be adjusted later to make REF=0
+                prev_len = None
+                # we'll handle within this cluster
+                # but we need to process first sequence
+                # We'll use a sub-loop
+            # We need to re-process by grouping original clusters
+        # Better: process each original cluster independently
+        final_mapping = {}
+        global_new_id = 0
+        ref_cluster = None
+        # We'll collect all new clusters across original clusters
+        for orig_cid, seqs in cluster_dict.items():
+            # sort by length descending
+            seqs_sorted = sorted(seqs, key=lambda x: x[1], reverse=True)
+            subcluster_id = None
+            prev_len = None
+            for alt_id, length, is_ref in seqs_sorted:
+                if subcluster_id is None:
+                    subcluster_id = global_new_id
+                    global_new_id += 1
+                else:
+                    # check if length difference exceeds threshold
+                    if prev_len - length > length_cut * prev_len:
+                        subcluster_id = global_new_id
+                        global_new_id += 1
+                final_mapping[alt_id] = subcluster_id
+                prev_len = length
+                if is_ref:
+                    ref_cluster = subcluster_id
+
+        # Now remap so REF cluster becomes 0
+        if ref_cluster is not None:
+            remap = {}
+            new_id = 0
+            # first assign REF cluster to 0
+            remap[ref_cluster] = 0
+            # then others
+            for cid in sorted(set(final_mapping.values())):
+                if cid != ref_cluster:
+                    new_id += 1
+                    remap[cid] = new_id
+            final_mapping = {alt_id: remap[cid] for alt_id, cid in final_mapping.items()}
+
+        new_clusters[(chrom, pos)] = final_mapping
+
+    return new_clusters
+
+
+def cluster_locus_with_vsearch(fasta_path, threads, identity, length_cut=0.1):
+    """
+    Run VSEARCH on locus, parse and refine clusters.
+    Returns mapping: alt_id -> cluster_id
+    """
+    # Create temporary UC file
+    temp_dir = os.path.dirname(fasta_path)
+    uc_file = os.path.join(temp_dir, "vsearch_out.uc")
+    if not run_vsearch(fasta_path, uc_file, threads, identity):
+        return {}
+
+    clusters = parse_vsearch_uc(uc_file)
+    if not clusters:
+        return {}
+
+    # Refine by length
+    refined = refine_clusters_by_length(clusters, length_cut)
+    if (fasta_path is None):  # dummy, but we need to extract chrom,pos
+        # but we have it from filename? We'll pass key from caller.
+        pass
+    # Since refine_clusters_by_length returns dict with (chrom,pos) keys,
+    # we need to extract the one for this locus.
+    # We'll modify refine_clusters_by_length to return mapping directly for the locus.
+    # Better: rewrite refine function to accept a single locus's cluster dict.
+    # We'll adjust.
+    return refined
+
+
+# We'll rewrite refine to be per-locus and integrated.
+def cluster_locus(fasta_path, threads, identity, length_cut=0.1):
+    """Run VSEARCH and return cluster mapping for this locus."""
+    temp_dir = os.path.dirname(fasta_path)
+    uc_file = os.path.join(temp_dir, "vsearch_out.uc")
+    if not run_vsearch(fasta_path, uc_file, threads, identity):
+        return {}
+
+    clusters = parse_vsearch_uc(uc_file)
+    if not clusters:
+        return {}
+
+    # clusters is dict with one key (chrom,pos)
+    # We'll extract the first (and only) key
+    for (chrom, pos), cluster_dict in clusters.items():
+        # refine within this locus
+        final_mapping = {}
+        global_new_id = 0
+        ref_cluster = None
+        for orig_cid, seqs in cluster_dict.items():
+            seqs_sorted = sorted(seqs, key=lambda x: x[1], reverse=True)
+            subcluster_id = None
+            prev_len = None
+            for alt_id, length, is_ref in seqs_sorted:
+                if subcluster_id is None:
+                    subcluster_id = global_new_id
+                    global_new_id += 1
+                else:
+                    if prev_len - length > length_cut * prev_len:
+                        subcluster_id = global_new_id
+                        global_new_id += 1
+                final_mapping[alt_id] = subcluster_id
+                prev_len = length
+                if is_ref:
+                    ref_cluster = subcluster_id
+
+        # Remap so REF cluster is 0
+        if ref_cluster is not None:
+            remap = {ref_cluster: 0}
+            new_id = 0
+            for cid in sorted(set(final_mapping.values())):
+                if cid != ref_cluster:
+                    new_id += 1
+                    remap[cid] = new_id
+            final_mapping = {alt_id: remap[cid] for alt_id, cid in final_mapping.items()}
+
+        return final_mapping
+
+    return {}
+
+
+# --------------------------- VCF update with ploidy ---------------------------
+def ensure_ref_and_alts_in_clusters(variant, clusters):
+    """Ensure all ALT alleles have a cluster assignment."""
+    chrom, pos, _, _, alts, _, _, _ = variant
+    if (chrom, pos) not in clusters:
+        clusters[(chrom, pos)] = {}
+    if 0 not in clusters[(chrom, pos)]:
+        clusters[(chrom, pos)][0] = 0
+    max_cid = max(clusters[(chrom, pos)].values(), default=0)
+    for i in range(1, len(alts)+1):
+        if i not in clusters[(chrom, pos)]:
+            max_cid += 1
+            clusters[(chrom, pos)][i] = max_cid
+    return clusters
+
+
+def update_genotypes_and_ac(variant, clusters, ploidy=2):
+    """
+    Update genotypes, AC, AN, AF after clustering, with ploidy support.
+    """
+    chrom, pos, vid, ref, alts, info, fmt, genotypes = variant
+    clusters = ensure_ref_and_alts_in_clusters(variant, clusters)
+    cluster_mapping = clusters[(chrom, pos)]
+
+    ref_cluster = cluster_mapping[0]
+    cluster_to_gt = {ref_cluster: 0}
+    next_gt = 1
+    for cid in sorted(set(cluster_mapping.values())):
+        if cid != ref_cluster:
+            cluster_to_gt[cid] = next_gt
+            next_gt += 1
+
+    new_genotypes = []
+    ac_counts = Counter()
+    total_alleles = 0
+
+    for g in genotypes:
+        alleles = split_genotype(g, ploidy)
+        if alleles is None:
+            new_genotypes.append(g if ploidy == 2 else '.')
+            continue
+
+        new_alleles = []
+        for orig in alleles:
+            if orig is None:
+                new_alleles.append('.')
+                continue
+            if orig in cluster_mapping:
+                cid = cluster_mapping[orig]
+                new_a = cluster_to_gt[cid]
+                if cid != ref_cluster:
+                    ac_counts[new_a] += 1
+                new_alleles.append(str(new_a))
+                total_alleles += 1
+            else:
+                new_alleles.append(str(orig))
+                total_alleles += 1
+
+        if ploidy == 1:
+            if len(new_alleles) == 1:
+                new_genotypes.append(new_alleles[0])
+            else:
+                new_genotypes.append(','.join(new_alleles))
+        else:
+            sep = '|' if '|' in g else '/'
+            new_genotypes.append(sep.join(new_alleles))
+
+    # Build new ALT list
+    cluster_to_seqs = defaultdict(list)
+    for alt_id, cid in cluster_mapping.items():
+        if cid != ref_cluster and alt_id > 0 and alt_id - 1 < len(alts):
+            cluster_to_seqs[cid].append(alts[alt_id-1])
+    new_alts = []
+    for cid in sorted(cluster_to_gt.keys()):
+        if cid == ref_cluster:
+            continue
+        if cid in cluster_to_seqs:
+            longest = max(cluster_to_seqs[cid], key=len)
+            new_alts.append(longest)
+        else:
+            new_alts.append('N')
+
+    # Update INFO
+    info_dict = {}
+    for field in info.split(';'):
+        if '=' in field:
+            k, v = field.split('=', 1)
+            info_dict[k] = v
+        else:
+            info_dict[field] = None
+    an = total_alleles
+    ac_str = ','.join(str(ac_counts[i]) for i in range(1, len(new_alts)+1))
+    af_str = ','.join(f"{ac_counts[i]/an:.6f}" if an > 0 else "0" for i in range(1, len(new_alts)+1))
+    info_dict['AC'] = ac_str
+    info_dict['AN'] = str(an)
+    info_dict['AF'] = af_str
+    new_info = ';'.join(f"{k}={v}" if v is not None else k for k, v in info_dict.items())
+
+    return (chrom, pos, vid, ref, new_alts, new_info, fmt, new_genotypes)
+
+
+# --------------------------- Main ---------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="PanSVmerger - VSEARCH-based clustering with length sub-clustering."
+    )
+    parser.add_argument("--input_vcf", required=True, help="Input VCF (can be .gz)")
+    parser.add_argument("--output_vcf", required=True, help="Output VCF after merging")
+    parser.add_argument("--new_cluster_file", default="cluster_mapping.txt",
+                        help="Output file for cluster mapping (chrom,pos,alt_id,cluster_id)")
+    parser.add_argument("--ploidy", type=int, default=2, choices=[1, 2],
+                        help="Ploidy: 1 for haploid, 2 for diploid (default: 2)")
+    parser.add_argument("--threads", type=int, default=4, help="VSEARCH threads")
+    parser.add_argument("--identity", type=float, default=0.9,
+                        help="VSEARCH identity threshold for clustering (default: 0.9)")
+    parser.add_argument("--length_cut", type=float, default=0.1,
+                        help="Proportional length difference to split VSEARCH clusters (default: 0.1)")
+    parser.add_argument("--batch_size", type=int, default=1000,
+                        help="Progress reporting interval")
+    args = parser.parse_args()
+
+    # Read input
+    variants, header = read_vcf(args.input_vcf)
+    write_vcf_header(args.output_vcf, header)
+
+    total = len(variants)
+    all_clusters = {}
+
+    # Create a temporary directory for this run
+    temp_dir = tempfile.mkdtemp(prefix="PanSVmerger_vsearch_")
+    try:
+        for idx, variant in enumerate(variants):
+            chrom, pos, vid, ref, alts, info, fmt, genotypes = variant
+            if idx % args.batch_size == 0:
+                sys.stderr.write(f"Processing {idx}/{total} variants...\n")
+
+            if len(alts) <= 1:
+                write_vcf_variant(args.output_vcf, variant)
+                all_clusters[(chrom, pos)] = {0: 0}
+                if len(alts) == 1:
+                    all_clusters[(chrom, pos)][1] = 1
                 continue
 
-            # Ensure reference and alternative alleles are included in clusters
-            updated_clusters = ensure_ref_and_alts_in_clusters(variant, initial_clusters)
-            
-            with open(f"{cluster_prefix}.uc", 'r') as infile:
-                lines_to_append = infile.readlines()
-            append_uc_to_merged(f"{cluster_prefix}.uc", merged_uc_file, lines_to_append, first_write=True)
-            first_write = False
-            save_cluster_mapping(updated_clusters, new_cluster_file)
-            save_insufficient_fields_lines(insufficient_fields_lines, insufficient_fields_file)
-            updated_variant = update_genotypes_and_ac(variant, updated_clusters)
-            write_vcf_variant(output_vcf, updated_variant)
-            
-            # Clean up temporary files
-#            for f in os.listdir():
- #               if f.startswith(cluster_prefix):
-  #                  os.remove(f)
-#
+            # Create temporary FASTA for this locus
+            fd, fasta_path = tempfile.mkstemp(suffix='.fasta', dir=temp_dir,
+                                              prefix=f"{chrom}_{pos}_")
+            os.close(fd)
+            write_locus_fasta(chrom, pos, ref, alts, fasta_path)
+
+            try:
+                cluster_mapping = cluster_locus(fasta_path, args.threads,
+                                                args.identity, args.length_cut)
+                if not cluster_mapping:
+                    # fallback: treat each ALT as separate
+                    cluster_mapping = {0: 0}
+                    for i in range(1, len(alts)+1):
+                        cluster_mapping[i] = i
+                # Ensure all ALT present
+                for alt_id in range(1, len(alts)+1):
+                    if alt_id not in cluster_mapping:
+                        max_cid = max(cluster_mapping.values(), default=0)
+                        cluster_mapping[alt_id] = max_cid + 1
+                if 0 not in cluster_mapping:
+                    cluster_mapping[0] = 0
+
+                all_clusters[(chrom, pos)] = cluster_mapping
+                updated = update_genotypes_and_ac(variant,
+                                                  {(chrom, pos): cluster_mapping},
+                                                  args.ploidy)
+                write_vcf_variant(args.output_vcf, updated)
+
+            except Exception as e:
+                sys.stderr.write(f"Error at {chrom}:{pos}: {e}\n")
+                write_vcf_variant(args.output_vcf, variant)
+
+            finally:
+                if os.path.exists(fasta_path):
+                    os.remove(fasta_path)
+
+        # Save cluster mapping
+        save_cluster_mapping(all_clusters, args.new_cluster_file)
+        sys.stderr.write(f"Done. Output VCF: {args.output_vcf}\n")
+        sys.stderr.write(f"Cluster mapping: {args.new_cluster_file}\n")
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Process VCF file and cluster variants using VSEARCH.")
-    parser.add_argument("input_vcf", help="Input VCF file")
-    parser.add_argument("output_vcf", help="Output VCF file")
-    parser.add_argument("tmp_fasta", help="Temporary FASTA file for VSEARCH")
-    parser.add_argument("cluster_prefix", help="Prefix for VSEARCH cluster output files")
-    parser.add_argument("merged_uc_file", help="File to store the merged cluster statistics")
-    parser.add_argument("new_cluster_file", help="File to store the new cluster mappings")
-    parser.add_argument("insufficient_fields_file", help="File to store not cluster mappings")
-    parser.add_argument("threads", type=int, help="Threads to run vsearch")
-    
-    args = parser.parse_args()
-    main(args.input_vcf, args.output_vcf, args.tmp_fasta, args.cluster_prefix, args.merged_uc_file, args.new_cluster_file,args.insufficient_fields_file, args.threads)
+    main()
