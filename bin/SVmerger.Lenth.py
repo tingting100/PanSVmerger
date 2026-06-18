@@ -1,16 +1,24 @@
+#!/usr/bin/env python3
+"""
+PanSVmerger - Length‑based clustering for multiallelic SVs
+Usage: python length_clustering.py --input_vcf in.vcf --output_vcf out.vcf [--eps 0.3] [--ploidy 2] [options]
+"""
+
 import os
+import sys
 import argparse
-from collections import Counter, defaultdict
-import shutil
+import tempfile
+import random
 import gzip
-import re
+from collections import Counter
 import numpy as np
-import pandas as pd
 from sklearn.cluster import DBSCAN
 from Bio import SeqIO
 
+
+# ---------- I/O functions ----------
 def read_vcf(vcf_file):
-    # Reads a VCF file and extracts variant information
+    """Read VCF, return variants list and header lines."""
     variants = []
     header = []
     if vcf_file.endswith('.gz'):
@@ -19,9 +27,9 @@ def read_vcf(vcf_file):
     else:
         open_func = open
         mode = 'r'
-    
-    with open_func(vcf_file, mode) as file:
-        for line in file:
+
+    with open_func(vcf_file, mode) as f:
+        for line in f:
             if line.startswith('##'):
                 header.append(line.strip().split('\t'))
                 continue
@@ -29,384 +37,388 @@ def read_vcf(vcf_file):
                 header.append(line.strip().split('\t'))
                 continue
             fields = line.strip().split('\t')
-            chrom, pos, id, ref, info, format_field = fields[0], int(fields[1]), fields[2], fields[3], fields[7], fields[8]
-            alts = fields[4].split(',')
+            chrom, pos, vid = fields[0], int(fields[1]), fields[2]
+            ref = fields[3]
+            alts = fields[4].split(',') if fields[4] != '.' else []
+            info = fields[7]
+            fmt = fields[8]
             genotypes = fields[9:]
-            variants.append((chrom, pos, id, ref, alts, info, format_field, genotypes))
+            variants.append((chrom, pos, vid, ref, alts, info, fmt, genotypes))
     return variants, header
 
-def write_tmp_fasta(chrom, pos, ref, alts, output_fasta):
-    with open(output_fasta, 'w') as file:
-        file.write(f">{chrom}-{pos}-ref\n{ref}\n")
-        for j, alt in enumerate(alts):
-            file.write(f">{chrom}-{pos}-alt{j+1}\n{alt}\n")
 
-def compute_weighted_distance_matrix(sequences, alpha, k):
-    """计算距离矩阵，仅基于长度距离"""
-    n = len(sequences)
+def write_vcf_header(output_file, header):
+    with open(output_file, 'w') as f:
+        for line_parts in header:
+            f.write("\t".join(line_parts) + "\n")
+
+
+def write_vcf_variant(output_file, variant):
+    chrom, pos, vid, ref, alts, info, fmt, genotypes = variant
+    with open(output_file, 'a') as f:
+        f.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{','.join(alts)}\t.\t.\t{info}\t{fmt}\t"
+                + "\t".join(genotypes) + "\n")
+
+
+def save_cluster_mapping(cluster_mapping, output_file):
+    """Save (chrom, pos) -> alt_id -> cluster_id mapping."""
+    with open(output_file, 'w') as f:
+        for (chrom, pos), alt_dict in sorted(cluster_mapping.items()):
+            for alt_id, cluster_id in alt_dict.items():
+                f.write(f"{chrom}\t{pos}\t{alt_id}\t{cluster_id}\n")
+
+
+# ---------- Clustering core ----------
+def write_tmp_fasta(chrom, pos, ref, alts, fasta_path):
+    """Write all alleles (ref + alts) to a FASTA file."""
+    with open(fasta_path, 'w') as f:
+        f.write(f">{chrom}-{pos}-ref\n{ref}\n")
+        for j, alt in enumerate(alts, 1):
+            f.write(f">{chrom}-{pos}-alt{j}\n{alt}\n")
+
+
+def compute_length_distance_matrix(seqs):
+    """Compute pairwise length‑based distance matrix (0..1)."""
+    n = len(seqs)
     matrix = np.zeros((n, n))
     for i in range(n):
+        li = len(seqs[i])
         for j in range(i + 1, n):
-            len_i, len_j = len(sequences[i]), len(sequences[j])
-            # 只计算长度距离：归一化的长度差异
-            len_diff = abs(len_i - len_j) / max(len_i, len_j) if max(len_i, len_j) != 0 else 0.0
-            matrix[i][j] = matrix[j][i] = len_diff
+            lj = len(seqs[j])
+            if max(li, lj) == 0:
+                dist = 0.0
+            else:
+                dist = abs(li - lj) / max(li, lj)
+            matrix[i][j] = matrix[j][i] = dist
     return matrix
 
+
 def reassign_noise_labels(labels):
-    """重新分配噪声标签（-1）"""
+    """DBSCAN noise (-1) -> new unique cluster IDs."""
     labels = np.array(labels)
     if len(labels) == 0:
         return labels
-    
-    # 找出非噪声的最大标签
     non_noise = labels[labels != -1]
     max_label = non_noise.max() if len(non_noise) > 0 else -1
-    
-    # 为每个噪声分配新标签
     next_label = max_label + 1
     for i in range(len(labels)):
         if labels[i] == -1:
             labels[i] = next_label
             next_label += 1
-    
     return labels
 
-def cluster_locus(fasta_path, k, eps, lambda_param):
-    """使用基于长度的DBSCAN聚类单个位点"""
+
+def cluster_locus(fasta_path, eps):
+    """
+    Cluster alleles at one locus using length‑only DBSCAN.
+    Returns (cluster_mapping: alt_id->cluster_id, cluster_to_seq: cluster_id->representative_seq)
+    """
     try:
         records = list(SeqIO.parse(fasta_path, 'fasta'))
-    except:
-        print(f"无法读取FASTA文件: {fasta_path}")
+    except Exception:
+        print(f"Warning: cannot read FASTA {fasta_path}", file=sys.stderr)
         return {}, {}
-    
+
     if not records:
         return {}, {}
-    
+
     ids = [r.id for r in records]
     seqs = [str(r.seq) for r in records]
-    
-    # 解析染色体和位置信息
-    chrom_pos = os.path.basename(fasta_path).replace('.fa', '').replace('.fasta', '')
-    if '-' in chrom_pos:
-        chrom, pos = chrom_pos.split('-', 1)
-        pos = int(pos)
-    else:
-        chrom, pos = chrom_pos, 0
-    
-    # 如果只有一个序列（只有REF）
+
+    # Special cases: 1 or 2 alleles
     if len(seqs) == 1:
-        cluster_mapping = {0: 0}  # REF -> cluster 0
-        cluster_to_seq = {0: seqs[0]}  # 簇ID -> 序列
-        return cluster_mapping, cluster_to_seq
-    
-    # 如果只有两个序列（REF + 1个ALT）
+        return {0: 0}, {0: seqs[0]}
+
     if len(seqs) == 2:
-        # REF总是簇0
-        # ALT是簇1
-        cluster_mapping = {}
-        cluster_to_seq = {}
-        
-        # 找到REF和ALT的索引
         ref_idx = 0
-        for i, seq_id in enumerate(ids):
-            if '-ref' in seq_id:
+        for i, sid in enumerate(ids):
+            if '-ref' in sid:
                 ref_idx = i
                 break
-        
         alt_idx = 1 - ref_idx
-        
-        # 解析ALT ID
-        alt_id = 0
-        for seq_id in ids:
-            if '-alt' in seq_id:
-                alt_part = seq_id.split('-')[-1]
-                alt_id = int(alt_part.replace('alt', ''))
+        alt_id = 1
+        for sid in ids:
+            if '-alt' in sid:
+                alt_id = int(sid.split('-')[-1].replace('alt', ''))
                 break
-        
-        cluster_mapping[0] = 0  # REF -> cluster 0
-        cluster_mapping[alt_id] = 1  # ALT -> cluster 1
-        cluster_to_seq[0] = seqs[ref_idx]
-        cluster_to_seq[1] = seqs[alt_idx]
-        
-        return cluster_mapping, cluster_to_seq
-    
-    # 3个或更多序列，进行DBSCAN聚类
-    # 仅使用长度距离
-    dist_matrix = compute_weighted_distance_matrix(seqs, alpha=None, k=None)
-    dbscan = DBSCAN(eps=eps, min_samples=2, metric='precomputed')
-    labels = dbscan.fit_predict(dist_matrix)
+        return {0: 0, alt_id: 1}, {0: seqs[ref_idx], 1: seqs[alt_idx]}
+
+    # >= 3 sequences: DBSCAN on length distance matrix
+    dist_matrix = compute_length_distance_matrix(seqs)
+    db = DBSCAN(eps=eps, min_samples=2, metric='precomputed')
+    labels = db.fit_predict(dist_matrix)
     labels = reassign_noise_labels(labels)
-    
-    # 找到REF的索引
+
+    # Find reference index
     ref_idx = 0
-    for i, seq_id in enumerate(ids):
-        if '-ref' in seq_id:
+    for i, sid in enumerate(ids):
+        if '-ref' in sid:
             ref_idx = i
             break
-    
-    # 如果找到REF，重映射标签使REF为簇0
+
+    # Remap labels so that REF cluster becomes 0
     if ref_idx < len(labels):
         ref_label = labels[ref_idx]
-        # 收集所有标签
-        all_labels = list(dict.fromkeys(labels.tolist()))
-        # 确保REF标签在最前面
-        if ref_label in all_labels:
-            all_labels.remove(ref_label)
-        ordered_labels = [ref_label] + all_labels
-        remap = {old: new for new, old in enumerate(ordered_labels)}
+        unique_labels = []
+        for lab in labels:
+            if lab not in unique_labels:
+                unique_labels.append(lab)
+        if ref_label in unique_labels:
+            unique_labels.remove(ref_label)
+        ordered = [ref_label] + unique_labels
+        remap = {old: new for new, old in enumerate(ordered)}
         labels = np.array([remap[lab] for lab in labels], dtype=int)
-    
-    # 创建映射关系
-    cluster_mapping = {}  # alt_id -> cluster_id
-    cluster_to_seq = {}   # cluster_id -> representative_sequence
-    
-    for seq_id, seq, label in zip(ids, seqs, labels):
+
+    # Build mapping
+    cluster_mapping = {}
+    cluster_to_seq = {}
+
+    for seq_id, seq, lab in zip(ids, seqs, labels):
         if '-alt' in seq_id:
-            # 解析ALT ID
-            alt_part = seq_id.split('-')[-1]
-            alt_id = int(alt_part.replace('alt', ''))
-            cluster_mapping[alt_id] = label
-            
-            # 记录每个簇的序列（如果同一个簇有多个序列，保留最长的）
-            if label not in cluster_to_seq or len(seq) > len(cluster_to_seq[label]):
-                cluster_to_seq[label] = seq
+            alt_id = int(seq_id.split('-')[-1].replace('alt', ''))
+            cluster_mapping[alt_id] = lab
+            if lab not in cluster_to_seq or len(seq) > len(cluster_to_seq[lab]):
+                cluster_to_seq[lab] = seq
         elif '-ref' in seq_id:
-            cluster_mapping[0] = label  # REF的alt_id为0
-            cluster_to_seq[label] = seq
-    
+            cluster_mapping[0] = lab
+            cluster_to_seq[lab] = seq
+
     return cluster_mapping, cluster_to_seq
 
-def ensure_ref_and_alts_in_clusters(variant, clusters):
-    chrom, pos, id, ref, alts, info, format_field, genotypes = variant
-    
-    # Initialize cluster dictionary for the variant's position if it doesn't exist
-    if (chrom, pos) not in clusters:
-        clusters[(chrom, pos)] = {}
-    
-    # Ensure the reference sequence (ID = 0) is in the cluster
-    if 0 not in clusters[(chrom, pos)]:
-        clusters[(chrom, pos)][0] = 0  # Add reference sequence with cluster ID 0
 
-    # Add alternative alleles and ensure they have unique IDs
-    for i in range(1, len(alts) + 1):
-        if i not in clusters[(chrom, pos)]:
-            # Assign a new cluster ID ensuring uniqueness
-            clusters[(chrom, pos)][i] = max(clusters[(chrom, pos)].values(), default=0) + 1
-    
-    return clusters
+# ---------- VCF update with ploidy support ----------
+def split_genotype(gt_str, ploidy):
+    """
+    Split genotype string into list of allele indices based on ploidy.
+    Diploid (2): split by '/' or '|', or treat single as 0/0
+    Haploid (1): return [int(gt_str)] if not missing
+    """
+    if gt_str in ('.', './.', '.|.'):
+        return None
+    if ploidy == 1:
+        # Haploid: genotype is a single digit (e.g., "0" or "1")
+        if gt_str == '.':
+            return None
+        try:
+            return [int(gt_str)]
+        except ValueError:
+            return None
+    else:
+        # Diploid: split by separator
+        if '/' in gt_str:
+            parts = gt_str.split('/')
+        elif '|' in gt_str:
+            parts = gt_str.split('|')
+        else:
+            # Single allele, treat as homozygous
+            if gt_str == '.':
+                return None
+            try:
+                return [int(gt_str), int(gt_str)]
+            except ValueError:
+                return None
+        alleles = []
+        for p in parts:
+            if p == '.':
+                alleles.append(None)
+            else:
+                try:
+                    alleles.append(int(p))
+                except ValueError:
+                    alleles.append(None)
+        return alleles
 
-def update_genotypes_and_ac(variant, clusters, cluster_to_seq):
-    chrom, pos, id, ref, alts, info, format_field, genotypes = variant
-    
-    # 如果没有聚类信息，返回原始variant
-    if (chrom, pos) not in clusters:
+
+def update_genotypes_and_ac(variant, all_clusters, cluster_to_seq, ploidy=2):
+    chrom, pos, vid, ref, alts, info, fmt, genotypes = variant
+
+    if (chrom, pos) not in all_clusters:
         return variant
-    
-    cluster_mapping = clusters[(chrom, pos)]
-    
-    print(f"Cluster mapping for {chrom}-{pos}: {cluster_mapping}")
 
+    cluster_mapping = all_clusters[(chrom, pos)]
+
+    # Build new genotype mapping: cluster -> new genotype index
+    ref_cluster = cluster_mapping[0]
+    new_gt_map = {ref_cluster: 0}
+    next_gt = 1
+    for cluster_id in sorted(set(cluster_mapping.values())):
+        if cluster_id != ref_cluster:
+            new_gt_map[cluster_id] = next_gt
+            next_gt += 1
+
+    # Re‑genotype all samples
     new_genotypes = []
     ac_counts = Counter()
+    total_alleles = 0  # AN
 
-    # Find the reference sequence's cluster ID
-    ref_cluster_id = cluster_mapping[0]
-    
-    # Redefine genotypes based on clusters
-    cluster_to_genotype = {ref_cluster_id: 0}
-    next_genotype = 1
+    for g in genotypes:
+        alleles = split_genotype(g, ploidy)
+        if alleles is None:
+            new_genotypes.append(g if ploidy == 2 else '.')
+            continue
 
-    for cluster_id in sorted(set(cluster_mapping.values())):
-        if cluster_id != ref_cluster_id:
-            cluster_to_genotype[cluster_id] = next_genotype
-            next_genotype += 1
+        new_alleles = []
+        for orig_gt in alleles:
+            if orig_gt is None:
+                new_alleles.append('.')
+                continue
+            if orig_gt in cluster_mapping:
+                cid = cluster_mapping[orig_gt]
+                new_a = new_gt_map[cid]
+                if cid != ref_cluster:
+                    ac_counts[new_a] += 1
+                new_alleles.append(str(new_a))
+                total_alleles += 1
+            else:
+                # fallback
+                new_alleles.append(str(orig_gt))
+                total_alleles += 1
 
-    for genotype in genotypes:
-        if genotype == '.':
-            new_genotype = genotype
+        # Format genotype based on ploidy
+        if ploidy == 1:
+            # Haploid: single value
+            if len(new_alleles) == 1:
+                new_genotypes.append(new_alleles[0])
+            else:
+                # Should not happen for haploid
+                new_genotypes.append(','.join(new_alleles))
         else:
-            original_genotype = int(genotype)
-            if original_genotype in cluster_mapping:
-                new_genotype = str(cluster_to_genotype[cluster_mapping[original_genotype]])
-                if cluster_mapping[original_genotype] != ref_cluster_id:
-                    ac_counts[int(new_genotype)] += 1
-            else:
-                # Handle singleton sequences
-                new_genotype = str(next_genotype)
-                next_genotype += 1
-                ac_counts[int(new_genotype)] += 1
-        new_genotypes.append(new_genotype)
+            # Diploid: join with '/' (unphased) or infer from original
+            sep = '/'  # default unphased
+            if '|' in g:
+                sep = '|'
+            new_genotypes.append(sep.join(new_alleles))
 
-    # Update ALT sequences: take the representative sequence from each cluster
+    # Build new ALT list from cluster representatives
     new_alts = []
-    
-    # 使用cluster_to_seq中的序列作为代表序列
-    for cluster_id in sorted(cluster_to_genotype.keys()):
-        if cluster_id != ref_cluster_id:
-            if cluster_id in cluster_to_seq:
-                new_alts.append(cluster_to_seq[cluster_id])
-            else:
-                # 如果簇没有代表序列，使用原始ALT中的第一个
-                for alt_id, cid in cluster_mapping.items():
-                    if cid == cluster_id and alt_id > 0 and alt_id - 1 < len(alts):
-                        new_alts.append(alts[alt_id - 1])
-                        break
-    
-    # 如果 new_alts 为空，直接返回原始 variant
+    for cluster_id in sorted(new_gt_map.keys()):
+        if cluster_id == ref_cluster:
+            continue
+        if cluster_id in cluster_to_seq:
+            new_alts.append(cluster_to_seq[cluster_id])
+        else:
+            for alt_id, cid in cluster_mapping.items():
+                if cid == cluster_id and alt_id > 0 and alt_id - 1 < len(alts):
+                    new_alts.append(alts[alt_id - 1])
+                    break
+
     if not new_alts:
         return variant
 
-    # Update INFO field with new AC values
-    ac_values = [str(ac_counts[i]) for i in range(1, len(new_alts) + 1)]
-    info_fields = info.split(';')
-    updated_info_fields = []
-    for field in info_fields:
-        if field.startswith('AC='):
-            updated_info_fields.append('AC=' + ','.join(ac_values))
-        else:
-            updated_info_fields.append(field)
-
-    # Calculate AF values
-    an = sum(1 for genotype in genotypes if genotype != '.')
-    # Update INFO field with new AN value
-    an_updated = False
-    for i, field in enumerate(updated_info_fields):
-        if field.startswith('AN='):
-            updated_info_fields[i] = f'AN={an}'
-            an_updated = True
-            break
-    if not an_updated:
-        updated_info_fields.append(f'AN={an}')
-
-    af_values = [f"{ac_counts[i] / an:.6f}" for i in range(1, len(new_alts) + 1)]
- 
-    # Update INFO field with new AF values
-    af_updated = False
-    for i, field in enumerate(updated_info_fields):
-        if field.startswith('AF='):
-            updated_info_fields[i] = 'AF=' + ','.join(af_values)
-            af_updated = True
-            break
-    if not af_updated:
-        updated_info_fields.append('AF=' + ','.join(af_values))
-    
-    # 更新REF序列
+    # Update REF sequence
     new_ref = ref
-    if 0 in cluster_mapping and cluster_mapping[0] in cluster_to_seq:
-        new_ref = cluster_to_seq[cluster_mapping[0]]
-    
-    updated_info = ';'.join(updated_info_fields)
-    
-    return (chrom, pos, id, new_ref, new_alts, updated_info, format_field, new_genotypes)
+    if ref_cluster in cluster_to_seq:
+        new_ref = cluster_to_seq[ref_cluster]
 
-def write_vcf_header(output_file, header):
-    with open(output_file, 'w') as file:
-        for i in header:
-            file.write("\t".join(i) + "\n")
+    # Update INFO: AC, AN, AF
+    an = total_alleles
+    ac_str = ','.join(str(ac_counts[i]) for i in range(1, len(new_alts)+1))
+    af_str = ','.join(f"{ac_counts[i]/an:.6f}" if an > 0 else "0" for i in range(1, len(new_alts)+1))
 
-def write_vcf_variant(output_file, variant):
-    with open(output_file, 'a') as file:
-        chrom, pos, id, ref, alts, info, format_field, genotypes = variant
-        file.write("{}\t{}\t{}\t{}\t{}\t.\t.\t{}\t{}\t{}\n".format(
-            chrom, pos, id, ref, ",".join(alts), info, format_field, "\t".join(genotypes)))
+    info_dict = {}
+    for field in info.split(';'):
+        if '=' in field:
+            key, val = field.split('=', 1)
+            info_dict[key] = val
+        else:
+            info_dict[field] = None
+    info_dict['AC'] = ac_str
+    info_dict['AN'] = str(an)
+    info_dict['AF'] = af_str
 
-def save_cluster_mapping(cluster_mapping, output_file):
-    # Save the cluster mapping to a file
-    with open(output_file, 'w') as file:
-        for (chrom, pos), alt_dict in sorted(cluster_mapping.items()):
-            for alt_id, cluster_id in alt_dict.items():
-                file.write(f"{chrom}\t{pos}\t{alt_id}\t{cluster_id}\n")
+    new_info = ';'.join(f"{k}={v}" if v is not None else k for k, v in info_dict.items())
 
-def main(input_vcf, output_vcf, tmp_fasta, cluster_prefix, new_cluster_file, threads, eps=0.3, k=5, lambda_param=20.0):
-    variants, header = read_vcf(input_vcf)
-    write_vcf_header(output_vcf, header)
-    
-    # 存储所有聚类信息
+    return (chrom, pos, vid, new_ref, new_alts, new_info, fmt, new_genotypes)
+
+
+# ---------- Main ----------
+def main():
+    parser = argparse.ArgumentParser(
+        description="PanSVmerger - Length‑based multiallelic SV clustering (pure length distance)."
+    )
+    parser.add_argument("--input_vcf", required=True,
+                        help="Input VCF file (can be .gz).")
+    parser.add_argument("--output_vcf", required=True,
+                        help="Output VCF file after merging.")
+    parser.add_argument("--eps", type=float, default=0.3,
+                        help="DBSCAN epsilon for length distance (default: 0.3).")
+    parser.add_argument("--ploidy", type=int, default=2, choices=[1, 2],
+                        help="Ploidy: 1 for haploid, 2 for diploid (default: 2).")
+    parser.add_argument("--k", type=int, default=5,
+                        help="k-mer size (not used in length-based mode, kept for compatibility).")
+    parser.add_argument("--lambda_param", type=float, default=20.0,
+                        help="Lambda parameter (not used in length-based mode, kept for compatibility).")
+    parser.add_argument("--threads", type=int, default=4,
+                        help="Number of threads (not used in length-based mode, kept for compatibility).")
+    parser.add_argument("--new_cluster_file", default="cluster_mapping.txt",
+                        help="Output file for cluster mapping (chrom,pos,alt_id,cluster_id).")
+    args = parser.parse_args()
+
+    variants, header = read_vcf(args.input_vcf)
+    write_vcf_header(args.output_vcf, header)
+
     all_clusters = {}
     all_cluster_seqs = {}
-    
-    print(f"Processing {len(variants)} variants...")
-    
+
+    temp_dir = tempfile.gettempdir()
+    pid = os.getpid()
+    rand_suffix = random.randint(10000, 99999)
+    tmp_fasta = os.path.join(temp_dir, f"tmp_cluster_{pid}_{rand_suffix}.fasta")
+
+    print(f"Processing {len(variants)} variants (ploidy={args.ploidy})...")
+
     for i, variant in enumerate(variants):
-        chrom, pos, id, ref, alts, info, format_field, genotypes = variant
-        
+        chrom, pos, vid, ref, alts, info, fmt, genotypes = variant
+
         if i % 100 == 0:
             print(f"Processed {i}/{len(variants)} variants...")
-        
+
         if len(alts) == 1:
-            # 直接输出
-            write_vcf_variant(output_vcf, variant)
-            # 记录聚类信息（REF为0，ALT为1）
+            write_vcf_variant(args.output_vcf, variant)
             all_clusters[(chrom, pos)] = {0: 0, 1: 1}
             all_cluster_seqs[(chrom, pos)] = {0: ref, 1: alts[0]}
-        else:
-            # 创建临时FASTA文件
-            write_tmp_fasta(chrom, pos, ref, alts, tmp_fasta)
-            
-            # 使用DBSCAN聚类
-            cluster_mapping, cluster_to_seq = cluster_locus(tmp_fasta, k, eps, lambda_param)
-            
-            if not cluster_mapping:
-                # 如果没有聚类信息，直接输出原始变异
-                write_vcf_variant(output_vcf, variant)
-                # 为每个ALT分配唯一的簇ID
-                cluster_dict = {0: 0}
-                seq_dict = {0: ref}
-                for alt_idx in range(1, len(alts) + 1):
-                    cluster_dict[alt_idx] = alt_idx
-                    seq_dict[alt_idx] = alts[alt_idx - 1]
-                all_clusters[(chrom, pos)] = cluster_dict
-                all_cluster_seqs[(chrom, pos)] = seq_dict
-                continue
-            
-            # 确保所有ALT都在聚类中
-            for alt_idx in range(1, len(alts) + 1):
-                if alt_idx not in cluster_mapping:
-                    # 分配新的簇ID
-                    max_cluster = max(cluster_mapping.values()) if cluster_mapping else 0
-                    cluster_mapping[alt_idx] = max_cluster + 1
-            
-            # 确保REF在聚类中
-            if 0 not in cluster_mapping:
-                cluster_mapping[0] = 0
-            
-            # 记录聚类信息
-            all_clusters[(chrom, pos)] = cluster_mapping
-            all_cluster_seqs[(chrom, pos)] = cluster_to_seq
-            
-            # 更新VCF条目
-            updated_variant = update_genotypes_and_ac(variant, all_clusters, cluster_to_seq)
-            write_vcf_variant(output_vcf, updated_variant)
-    
-    # 保存聚类映射
-    save_cluster_mapping(all_clusters, new_cluster_file)
-    
-    print(f"Processing complete! Results saved to {output_vcf}")
-    print(f"Cluster mapping saved to {new_cluster_file}")
+            continue
+
+        write_tmp_fasta(chrom, pos, ref, alts, tmp_fasta)
+        cluster_mapping, cluster_to_seq = cluster_locus(tmp_fasta, args.eps)
+
+        if not cluster_mapping:
+            write_vcf_variant(args.output_vcf, variant)
+            cl_dict = {0: 0}
+            seq_dict = {0: ref}
+            for alt_idx in range(1, len(alts)+1):
+                cl_dict[alt_idx] = alt_idx
+                seq_dict[alt_idx] = alts[alt_idx-1]
+            all_clusters[(chrom, pos)] = cl_dict
+            all_cluster_seqs[(chrom, pos)] = seq_dict
+            continue
+
+        max_cluster = max(cluster_mapping.values()) if cluster_mapping else -1
+        for alt_idx in range(1, len(alts)+1):
+            if alt_idx not in cluster_mapping:
+                max_cluster += 1
+                cluster_mapping[alt_idx] = max_cluster
+                if max_cluster not in cluster_to_seq:
+                    cluster_to_seq[max_cluster] = alts[alt_idx-1]
+
+        if 0 not in cluster_mapping:
+            cluster_mapping[0] = max_cluster + 1
+            cluster_to_seq[cluster_mapping[0]] = ref
+
+        all_clusters[(chrom, pos)] = cluster_mapping
+        all_cluster_seqs[(chrom, pos)] = cluster_to_seq
+
+        updated = update_genotypes_and_ac(variant, all_clusters, cluster_to_seq, args.ploidy)
+        write_vcf_variant(args.output_vcf, updated)
+
+    if os.path.exists(tmp_fasta):
+        os.remove(tmp_fasta)
+
+    save_cluster_mapping(all_clusters, args.new_cluster_file)
+
+    print(f"Done. Output VCF: {args.output_vcf}")
+    print(f"Cluster mapping: {args.new_cluster_file}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Process VCF file and cluster variants using length-based DBSCAN.")
-    parser.add_argument("--input_vcf", required=True, help="Input VCF file")
-    parser.add_argument("--output_vcf", required=True, help="Output VCF file")
-    parser.add_argument("--tmp_fasta", default="tmp_cluster.fasta", help="Temporary FASTA file for clustering")
-    parser.add_argument("--cluster_prefix", default="cluster", help="Prefix for cluster output files")
-    parser.add_argument("--new_cluster_file", default="cluster_mapping.txt", help="File to save cluster mapping")
-    parser.add_argument("--eps", type=float, default=0.3, help="DBSCAN eps parameter")
-    parser.add_argument("--k", type=int, default=5, help="k-mer size (not used for length-based clustering)")
-    parser.add_argument("--lambda_param", type=float, default=20.0, help="Lambda parameter (not used for length-based clustering)")
-    parser.add_argument("--threads", type=int, default=4, help="Threads (kept for compatibility)")
-    
-    args = parser.parse_args()
-    
-    main(
-        args.input_vcf,
-        args.output_vcf,
-        args.tmp_fasta,
-        args.cluster_prefix,
-        args.new_cluster_file,
-        args.threads,
-        eps=args.eps,
-        k=args.k,
-        lambda_param=args.lambda_param
-    )
+    main()
