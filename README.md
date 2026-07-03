@@ -41,7 +41,7 @@ python bin/filter_tr_region.py \
 For VCF record, PanSVmerger identifies loci where the difference length between reference and alternate allele sequences is ≥50 bp.
 
 ```bash
-perl bin/get.SV.pl \
+perl bin/graph.getSV.pl \
     --vcf filtered.vcf \ 
     --out filtered.SV.vcf \
 ```
