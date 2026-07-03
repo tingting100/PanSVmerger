@@ -104,7 +104,7 @@ PanSVMerger/
 
 ## 🤝 Contact & Citation
 If you use PanSVmerger in your research, please cite:
-> *Xxx, et al. (2025). PanSVmerger: A pipeline for structural variant consolidation in pangenome graphs.*
+PanSVmerger: a flexible pipeline for merging multiallelic structural variants in pangenome graphs
 
 **Support:**
 For questions or bug reports, please open an [issue](https://github.com/tingting100/PanSVMerger/issues) or contact:
