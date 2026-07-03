@@ -27,18 +27,7 @@ pip install pysam scikit-learn biopython numpy pandas tqdm
 
 ## 🚀 Pipeline Workflow
 
-### Step 1: SV Extraction & Normalization
-Graph-based variants are often represented as complex bubbles. We first decompose these into primitive records and then reconstruct them into standardized multi-allelic sites.
-
-```bash
-# Decompose complex graph variants
-vcfwave -t 16 input_graph.vcf.gz > decomposed.vcf
-
-# Normalize and create multi-allelic records
-bcftools norm --threads 16 -m- decomposed.vcf | vcfcreatemulti > standardized.vcf
-```
-
-### Step 2: Complex Region Masking
+### Step 1: Complex Region Masking
 Biological "noise" in regions like centromeres, telomeres, and repetitive elements (STRs/VNTRs) can lead to unreliable SV calls. We filter these out using a BED-based approach.
 
 ```bash
@@ -46,7 +35,15 @@ python bin/filter_tr_region.py \
     --vcf standardized.vcf \
     --bed complex_regions.bed \
     --out filtered.vcf \
-    --padding 50
+```
+
+### Step 2: SV locus extraction
+For VCF record, PanSVmerger identifies loci where the difference length between reference and alternate allele sequences is ≥50 bp.
+
+```bash
+perl bin/get.SV.pl \
+    --vcf filtered.vcf \ 
+    --out filtered.SV.vcf \
 ```
 
 ### Step 3: Multi-Allele Clustering
