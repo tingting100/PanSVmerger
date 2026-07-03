@@ -108,5 +108,5 @@ If you use PanSVmerger in your research, please cite:
 
 **Support:**
 For questions or bug reports, please open an [issue](https://github.com/tingting100/PanSVMerger/issues) or contact:
-- tingyang100@126.com
+- yangting@caas.cn
 ```
