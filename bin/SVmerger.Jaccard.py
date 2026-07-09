@@ -1,485 +1,369 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.9
 """
-PanSVmerger - Jaccard‑based length‑grouped DBSCAN clustering for multiallelic SVs
-
-Usage:
-    python jaccard_clustering.py --input_vcf input.vcf.gz --output_vcf output.vcf [options]
-
-This script clusters alternate alleles at each multiallelic locus using Jaccard distance
-and DBSCAN, with separate clustering parameters for short and long sequences.
+SV.merge.jaccard.py
+- Parallel DBSCAN clustering
+- Short alleles: k-mer similarity only
+- Long alleles: Jaccard + length penalty
 """
 
 import os
-import sys
 import argparse
-import gzip
 import tempfile
-import shutil
-from collections import Counter, defaultdict
+import gzip
 import numpy as np
+from collections import Counter, defaultdict
 from sklearn.cluster import DBSCAN
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
-
-# --------------------------- I/O functions ---------------------------
-def read_vcf(vcf_file):
-    """Read VCF file, return list of variants and header lines."""
-    variants = []
-    header = []
-    open_func = gzip.open if vcf_file.endswith('.gz') else open
-    mode = 'rt' if vcf_file.endswith('.gz') else 'r'
-    with open_func(vcf_file, mode) as f:
+# =========================
+# VCF I/O
+# =========================
+def read_vcf(path):
+    variants, header = [], []
+    opener = gzip.open if path.endswith(".gz") else open
+    mode = "rt" if path.endswith(".gz") else "r"
+    with opener(path, mode) as f:
         for line in f:
-            if line.startswith('##'):
-                header.append(line.strip().split('\t'))
-            elif line.startswith('#CHROM'):
-                header.append(line.strip().split('\t'))
+            if line.startswith("##"):
+                header.append(line.rstrip().split("\t"))
+            elif line.startswith("#CHROM"):
+                header.append(line.rstrip().split("\t"))
             else:
-                fields = line.strip().split('\t')
-                chrom, pos, vid = fields[0], int(fields[1]), fields[2]
-                ref = fields[3]
-                alts = fields[4].split(',') if fields[4] != '.' else []
-                info = fields[7]
-                fmt = fields[8]
-                genotypes = fields[9:]
-                variants.append((chrom, pos, vid, ref, alts, info, fmt, genotypes))
+                fld = line.rstrip().split("\t")
+                chrom, pos = fld[0], int(fld[1])
+                vid, ref, info, fmt = fld[2], fld[3], fld[7], fld[8]
+                alts = [] if fld[4] == "." else fld[4].split(",")
+                gts = fld[9:]
+                variants.append((chrom, pos, vid, ref, alts, info, fmt, gts))
     return variants, header
 
+def write_tmp_fasta(chrom, pos, ref, alts, path):
+    with open(path, "w") as f:
+        f.write(f">{chrom}-{pos}-ref\n{ref}\n")
+        for i, alt in enumerate(alts, 1):
+            f.write(f">{chrom}-{pos}-alt{i}\n{alt}\n")
 
-def write_vcf_header(output_file, header):
-    with open(output_file, 'w') as f:
-        for parts in header:
-            f.write("\t".join(parts) + "\n")
+def write_vcf_header(path, header):
+    with open(path, "w") as f:
+        for line in header:
+            f.write("\t".join(line) + "\n")
 
+def write_vcf_variant(path, var):
+    chrom, pos, vid, ref, alts, info, fmt, gts = var
+    alts_str = ",".join(alts) if alts else "."
+    gts_str = "\t".join(gts)
+    with open(path, "a") as f:
+        f.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{alts_str}\t.\t.\t{info}\t{fmt}\t{gts_str}\n")
 
-def write_vcf_variant(output_file, variant):
-    chrom, pos, vid, ref, alts, info, fmt, genotypes = variant
-    with open(output_file, 'a') as f:
-        f.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{','.join(alts)}\t.\t.\t{info}\t{fmt}\t"
-                + "\t".join(genotypes) + "\n")
+# =========================
+# Cluster mapping (APPEND)
+# =========================
+def save_cluster_mapping(cluster_mapping, out):
+    """Append all loci, never overwrite."""
+    with open(out, "a") as f:
+        for (chrom, pos), m in cluster_mapping.items():
+            for alt_id, cid in m.items():
+                f.write(f"{chrom}\t{pos}\t{alt_id}\t{cid}\n")
 
-
-def save_cluster_mapping(cluster_mapping, output_file):
-    """Save (chrom,pos) -> alt_id -> cluster_id mapping."""
-    with open(output_file, 'w') as f:
-        for (chrom, pos), alt_dict in sorted(cluster_mapping.items()):
-            for alt_id, cluster_id in alt_dict.items():
-                f.write(f"{chrom}\t{pos}\t{alt_id}\t{cluster_id}\n")
-
-
-# --------------------------- Genotype helper ---------------------------
-def split_genotype(gt_str, ploidy):
+# =========================
+# Distance functions
+# =========================
+def calculate_distance(seq1, seq2, use_length_penalty=True, alpha=0.7):
     """
-    Parse genotype string according to ploidy.
-    Returns list of allele indices (integers) or None if missing.
-    For diploid: splits by '/' or '|', returns two alleles.
-    For haploid: returns a single integer.
+    Calculate distance between two sequences.
+    - Short: Jaccard only (use_length_penalty=False)
+    - Long: Jaccard + length penalty (use_length_penalty=True)
     """
-    if gt_str in ('.', './.', '.|.'):
-        return None
-    if ploidy == 1:
-        # Haploid: genotype is a single digit
-        if gt_str == '.':
-            return None
-        try:
-            return [int(gt_str)]
-        except ValueError:
-            return None
-    else:
-        # Diploid
-        if '/' in gt_str:
-            parts = gt_str.split('/')
-        elif '|' in gt_str:
-            parts = gt_str.split('|')
-        else:
-            # Single allele, treat as homozygous
-            if gt_str == '.':
-                return None
-            try:
-                val = int(gt_str)
-                return [val, val]
-            except ValueError:
-                return None
-        alleles = []
-        for p in parts:
-            if p == '.':
-                alleles.append(None)
-            else:
-                try:
-                    alleles.append(int(p))
-                except ValueError:
-                    alleles.append(None)
-        return alleles
-
-
-# --------------------------- Jaccard clustering core ---------------------------
-def calculate_jaccard_distance(seq1, seq2, k=5):
-    """
-    Compute Jaccard distance (1 - intersection/union) between two sequences.
-    Uses adaptive k-mer size based on sequence length.
-    """
-    if len(seq1) == 0 or len(seq2) == 0:
+    if not seq1 or not seq2:
         return 1.0
-    min_len = min(len(seq1), len(seq2))
+
+    l1, l2 = len(seq1), len(seq2)
+    min_len = min(l1, l2)
+
     # adaptive k
     if min_len <= 5:
-        effective_k = 1
+        k = 1
     elif min_len <= 10:
-        effective_k = 2
+        k = 2
     elif min_len <= 20:
-        effective_k = 3
+        k = 3
     else:
-        effective_k = min(k, 5)
-    # Build k-mer sets
-    kmers1 = set(seq1[i:i+effective_k] for i in range(len(seq1) - effective_k + 1))
-    kmers2 = set(seq2[i:i+effective_k] for i in range(len(seq2) - effective_k + 1))
-    if not kmers1 or not kmers2:
+        k = 5
+
+    s1 = {seq1[i:i+k] for i in range(l1 - k + 1)}
+    s2 = {seq2[i:i+k] for i in range(l2 - k + 1)}
+    if not s1 or not s2:
         return 1.0
-    inter = len(kmers1.intersection(kmers2))
-    union = len(kmers1.union(kmers2))
-    similarity = inter / union if union > 0 else 0.0
-    return 1.0 - similarity
 
+    inter = len(s1 & s2)
+    union = len(s1 | s2)
+    jaccard = 1.0 - inter / union if union else 1.0
 
-def cluster_by_length_groups(sequences, length_threshold, eps_short, eps_long):
-    """
-    Cluster sequences using DBSCAN on Jaccard distance, splitting into short/long groups.
-    Returns dict {index_in_sequences: cluster_id} with cluster IDs starting from 0.
-    """
-    n = len(sequences)
-    short_indices = [i for i, seq in enumerate(sequences) if len(seq) < length_threshold]
-    long_indices = [i for i, seq in enumerate(sequences) if len(seq) >= length_threshold]
+    if not use_length_penalty:
+        return jaccard
 
-    cluster_mapping = {}
+    length_diff = abs(l1 - l2) / max(l1, l2)
+    return alpha * jaccard + (1 - alpha) * length_diff
 
-    # Cluster short sequences
-    if len(short_indices) > 1:
-        n_short = len(short_indices)
-        dist = np.zeros((n_short, n_short))
-        for a in range(n_short):
-            for b in range(a+1, n_short):
-                d = calculate_jaccard_distance(sequences[short_indices[a]],
-                                               sequences[short_indices[b]])
-                dist[a, b] = dist[b, a] = d
-        db = DBSCAN(eps=eps_short, min_samples=1, metric='precomputed', n_jobs=1)
-        labels = db.fit_predict(dist)
+# =========================
+# Clustering core
+# =========================
+def cluster_by_length_group(sequences, seq_ids, length_threshold, eps_short, eps_long):
+    short_idx = [i for i, s in enumerate(sequences) if len(s) < length_threshold]
+    long_idx = [i for i, s in enumerate(sequences) if len(s) >= length_threshold]
+
+    cluster = {}
+
+    # ---- Short: k-mer ONLY ----
+    if len(short_idx) > 1:
+        n = len(short_idx)
+        D = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                D[i, j] = D[j, i] = calculate_distance(
+                    sequences[short_idx[i]],
+                    sequences[short_idx[j]],
+                    use_length_penalty=False
+                )
+        labels = DBSCAN(eps=eps_short, min_samples=1, metric="precomputed").fit_predict(D)
         if -1 in labels:
-            labels = np.array([0] * n_short)   # treat noise as one cluster
-        for idx, orig_idx in enumerate(short_indices):
-            cluster_mapping[orig_idx] = labels[idx]
-    elif len(short_indices) == 1:
-        cluster_mapping[short_indices[0]] = 0
+            labels = np.zeros(n, dtype=int)
+        for i, sid in enumerate(short_idx):
+            cluster[sid] = labels[i]
+    elif len(short_idx) == 1:
+        cluster[short_idx[0]] = 0
 
-    # Cluster long sequences (offset cluster IDs)
-    if len(long_indices) > 1:
-        n_long = len(long_indices)
-        dist = np.zeros((n_long, n_long))
-        for a in range(n_long):
-            for b in range(a+1, n_long):
-                d = calculate_jaccard_distance(sequences[long_indices[a]],
-                                               sequences[long_indices[b]])
-                dist[a, b] = dist[b, a] = d
-        db = DBSCAN(eps=eps_long, min_samples=1, metric='precomputed', n_jobs=1)
-        labels = db.fit_predict(dist)
+    # ---- Long: Jaccard + length ----
+    if len(long_idx) > 1:
+        n = len(long_idx)
+        D = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                D[i, j] = D[j, i] = calculate_distance(
+                    sequences[long_idx[i]],
+                    sequences[long_idx[j]],
+                    use_length_penalty=True
+                )
+        labels = DBSCAN(eps=eps_long, min_samples=1, metric="precomputed").fit_predict(D)
         if -1 in labels:
-            labels = np.array([0] * n_long)
-        short_max = max(cluster_mapping.values()) if cluster_mapping else -1
-        offset = short_max + 1
-        for idx, orig_idx in enumerate(long_indices):
-            cluster_mapping[orig_idx] = labels[idx] + offset
-    elif len(long_indices) == 1:
-        short_max = max(cluster_mapping.values()) if cluster_mapping else -1
-        cluster_mapping[long_indices[0]] = short_max + 1
+            labels = np.zeros(n, dtype=int)
+        offset = len(set(cluster.values()))
+        for i, sid in enumerate(long_idx):
+            cluster[sid] = labels[i] + offset
+    elif len(long_idx) == 1:
+        cluster[long_idx[0]] = len(set(cluster.values()))
 
-    # Remap cluster IDs to be consecutive
-    unique = sorted(set(cluster_mapping.values()))
-    remap = {old: new for new, old in enumerate(unique)}
-    return {idx: remap[cid] for idx, cid in cluster_mapping.items()}
+    return cluster
 
-
-def cluster_sequences_with_length_groups(fasta_path, length_threshold, eps_short, eps_long):
-    """
-    Read sequences from FASTA, cluster them, and return mapping from ALT ID to cluster.
-    Returns: (id_to_cluster, empty_dict) for compatibility.
-    """
-    # Read sequences
-    sequences = []
-    seq_ids = []
-    with open(fasta_path, 'r') as f:
-        cur_id = None
-        cur_seq = []
+def cluster_sequences_with_length_groups(fasta, length_threshold, eps_short, eps_long):
+    seqs, ids = [], []
+    with open(fasta) as f:
+        s, sid = "", ""
         for line in f:
             line = line.strip()
-            if line.startswith('>'):
-                if cur_id is not None:
-                    sequences.append(''.join(cur_seq))
-                    seq_ids.append(cur_id)
-                cur_id = line[1:]
-                cur_seq = []
+            if line.startswith(">"):
+                if sid:
+                    seqs.append(s)
+                    ids.append(sid)
+                sid = line[1:]
+                s = ""
             else:
-                cur_seq.append(line)
-        if cur_id is not None:
-            sequences.append(''.join(cur_seq))
-            seq_ids.append(cur_id)
+                s += line
+        if sid:
+            seqs.append(s)
+            ids.append(sid)
 
-    # Find reference
-    ref_idx = None
-    for i, sid in enumerate(seq_ids):
-        if '-ref' in sid:
-            ref_idx = i
-            break
-    if ref_idx is None:
-        raise ValueError("No REF sequence found in FASTA")
+    ref_idx = next(i for i, sid in enumerate(ids) if "ref" in sid.lower())
+    cm = cluster_by_length_group(seqs, ids, length_threshold, eps_short, eps_long)
 
-    cluster_map = cluster_by_length_groups(sequences, length_threshold, eps_short, eps_long)
+    # ---- Force REF cluster = 0 ----
+    ref_cid = cm[ref_idx]
+    if ref_cid != 0:
+        zero_keys = [k for k, v in cm.items() if v == 0]
+        ref_keys = [k for k, v in cm.items() if v == ref_cid]
+        for k in zero_keys:
+            cm[k] = ref_cid
+        for k in ref_keys:
+            cm[k] = 0
 
-    # Ensure REF is in cluster 0
-    ref_cluster = cluster_map[ref_idx]
-    if ref_cluster != 0:
-        # Swap: any with 0 becomes ref_cluster, and ref becomes 0
-        for idx, cid in cluster_map.items():
-            if cid == 0:
-                cluster_map[idx] = ref_cluster
-        cluster_map[ref_idx] = 0
-        # Re-remap to consecutive
-        unique = sorted(set(cluster_map.values()))
-        remap = {old: new for new, old in enumerate(unique)}
-        cluster_map = {idx: remap[cid] for idx, cid in cluster_map.items()}
+    uni = sorted(set(cm.values()))
+    remap = {o: n for n, o in enumerate(uni)}
+    cm = {k: remap[v] for k, v in cm.items()}
 
-    # Build alt_id -> cluster mapping
-    id_to_cluster = {}
-    for idx, sid in enumerate(seq_ids):
-        if '-ref' in sid:
-            id_to_cluster[0] = cluster_map[idx]
-        elif '-alt' in sid:
-            # parse alt number
-            parts = sid.split('-')
-            alt_num = None
-            for p in parts:
-                if p.startswith('alt'):
-                    alt_num = int(p[3:])
-                    break
-            if alt_num is not None:
-                id_to_cluster[alt_num] = cluster_map[idx]
+    id2c = {}
+    for i, sid in enumerate(ids):
+        if "ref" in sid.lower():
+            id2c[0] = cm[i]
+        elif "alt" in sid.lower():
+            alt_id = int(sid.split("alt")[-1])
+            id2c[alt_id] = cm[i]
+    return id2c, {}
 
-    return id_to_cluster, {}
-
-
-# --------------------------- VCF update with ploidy support ---------------------------
+# =========================
+# VCF update
+# =========================
 def ensure_ref_and_alts_in_clusters(variant, clusters):
-    """Ensure all ALT alleles have a cluster assignment."""
-    chrom, pos, _, _, alts, _, _, _ = variant
+    chrom, pos, _, ref, alts, _, _, _ = variant
     if (chrom, pos) not in clusters:
         clusters[(chrom, pos)] = {}
     if 0 not in clusters[(chrom, pos)]:
         clusters[(chrom, pos)][0] = 0
-    max_cid = max(clusters[(chrom, pos)].values(), default=0)
-    for i in range(1, len(alts)+1):
+    mx = max(clusters[(chrom, pos)].values(), default=0)
+    for i in range(1, len(alts) + 1):
         if i not in clusters[(chrom, pos)]:
-            max_cid += 1
-            clusters[(chrom, pos)][i] = max_cid
+            mx += 1
+            clusters[(chrom, pos)][i] = mx
     return clusters
 
-
-def update_genotypes_and_ac(variant, clusters, ploidy=2):
-    """
-    Update genotypes, AC, AN, AF after clustering, with ploidy support.
-    """
-    chrom, pos, vid, ref, alts, info, fmt, genotypes = variant
+def update_genotypes_and_ac_with_ref_zero(variant, clusters):
+    chrom, pos, vid, ref, alts, info, fmt, gts = variant
     clusters = ensure_ref_and_alts_in_clusters(variant, clusters)
-    cluster_mapping = clusters[(chrom, pos)]
+    cm = clusters[(chrom, pos)]
 
-    ref_cluster = cluster_mapping[0]
-    cluster_to_gt = {ref_cluster: 0}
-    next_gt = 1
-    for cid in sorted(set(cluster_mapping.values())):
-        if cid != ref_cluster:
-            cluster_to_gt[cid] = next_gt
-            next_gt += 1
+    ref_cid = cm[0]
+    gt_map = {ref_cid: 0}
+    nxt = 1
+    for cid in sorted(set(cm.values())):
+        if cid != ref_cid:
+            gt_map[cid] = nxt
+            nxt += 1
 
-    new_genotypes = []
-    ac_counts = Counter()
-    total_alleles = 0  # AN
-
-    for g in genotypes:
-        alleles = split_genotype(g, ploidy)
-        if alleles is None:
-            # Missing genotype: keep as is (or '.' for haploid)
-            new_genotypes.append(g if ploidy == 2 else '.')
+    new_gts, ac = [], Counter()
+    for gt in gts:
+        if gt in (".", "./.", ".|."):
+            new_gts.append(gt)
             continue
-
-        new_alleles = []
-        for orig in alleles:
-            if orig is None:
-                new_alleles.append('.')
+        sep = "|" if "|" in gt else "/"
+        als = gt.split(sep)
+        new_a = []
+        for a in als:
+            if a == ".":
+                new_a.append(".")
                 continue
-            if orig in cluster_mapping:
-                cid = cluster_mapping[orig]
-                new_a = cluster_to_gt[cid]
-                if cid != ref_cluster:
-                    ac_counts[new_a] += 1
-                new_alleles.append(str(new_a))
-                total_alleles += 1
+            oa = int(a)
+            if oa in cm:
+                cid = cm[oa]
+                ng = gt_map[cid]
+                new_a.append(str(ng))
+                if ng != 0:
+                    ac[ng] += 1
             else:
-                # Should not happen
-                new_alleles.append(str(orig))
-                total_alleles += 1
+                new_a.append(a)
+        new_gts.append(sep.join(new_a))
 
-        # Format genotype according to ploidy
-        if ploidy == 1:
-            # Haploid: single value
-            if len(new_alleles) == 1:
-                new_genotypes.append(new_alleles[0])
-            else:
-                new_genotypes.append(','.join(new_alleles))
-        else:
-            # Diploid: preserve phasing
-            sep = '|' if '|' in g else '/'
-            new_genotypes.append(sep.join(new_alleles))
+    clu_seqs = defaultdict(list)
+    for aid, cid in cm.items():
+        if aid > 0 and aid - 1 < len(alts):
+            clu_seqs[cid].append(alts[aid - 1])
 
-    # Build new ALT list: one per non-ref cluster, using longest representative
-    cluster_to_seqs = defaultdict(list)
-    for alt_id, cid in cluster_mapping.items():
-        if cid != ref_cluster and alt_id > 0 and alt_id - 1 < len(alts):
-            cluster_to_seqs[cid].append(alts[alt_id-1])
     new_alts = []
-    for cid in sorted(cluster_to_gt.keys()):
-        if cid == ref_cluster:
+    for gid in sorted(gt_map.values()):
+        if gid == 0:
             continue
-        if cid in cluster_to_seqs:
-            longest = max(cluster_to_seqs[cid], key=len)
-            new_alts.append(longest)
+        for cid, g in gt_map.items():
+            if g == gid and cid in clu_seqs:
+                new_alts.append(max(clu_seqs[cid], key=len))
+                break
+
+    # ---- Parse INFO ----
+    infod = {}
+    for x in info.split(";"):
+        if "=" in x:
+            k, v = x.split("=", 1)
+            infod[k] = v
         else:
-            # Fallback (should not happen)
-            new_alts.append('N')
+            infod[x] = None
 
-    # Update INFO fields (AC, AN, AF)
-    info_dict = {}
-    for field in info.split(';'):
-        if '=' in field:
-            k, v = field.split('=', 1)
-            info_dict[k] = v
+    # ---- Calculate AN ----
+    an = 0
+    for gt in gts:
+        if gt not in (".", "./.", ".|."):
+            sep = "|" if "|" in gt else "/"
+            for a in gt.split(sep):
+                if a != ".":
+                    an += 1
+
+    # ---- Update AC, AN, AF ----
+    infod["AC"] = ",".join(str(ac.get(i, 0)) for i in range(1, len(new_alts) + 1))
+    infod["AN"] = str(an)
+    af_vals = []
+    for i in range(1, len(new_alts) + 1):
+        if an > 0:
+            af_vals.append(f"{ac.get(i, 0) / an:.6f}")
         else:
-            info_dict[field] = None
+            af_vals.append("0.000000")
+    infod["AF"] = ",".join(af_vals)
 
-    an = total_alleles
-    ac_str = ','.join(str(ac_counts[i]) for i in range(1, len(new_alts)+1))
-    af_str = ','.join(f"{ac_counts[i]/an:.6f}" if an > 0 else "0" for i in range(1, len(new_alts)+1))
-    info_dict['AC'] = ac_str
-    info_dict['AN'] = str(an)
-    info_dict['AF'] = af_str
+    # ---- Rebuild INFO ----
+    new_info = ";".join(f"{k}={v}" if v is not None else k for k, v in infod.items())
 
-    new_info = ';'.join(f"{k}={v}" if v is not None else k for k, v in info_dict.items())
+    return (chrom, pos, vid, ref, new_alts, new_info, fmt, new_gts)
 
-    return (chrom, pos, vid, ref, new_alts, new_info, fmt, new_genotypes)
-
-
-# --------------------------- Main ---------------------------
+# =========================
+# Main
+# =========================
 def main():
-    parser = argparse.ArgumentParser(
-        description="PanSVmerger - Jaccard‑based length‑grouped DBSCAN clustering."
-    )
-    parser.add_argument("--input_vcf", required=True,
-                        help="Input VCF file (can be .gz)")
-    parser.add_argument("--output_vcf", required=True,
-                        help="Output VCF file after merging")
-    parser.add_argument("--new_cluster_file", default="cluster_mapping.txt",
-                        help="Output file for cluster mapping (chrom,pos,alt_id,cluster_id)")
-    parser.add_argument("--ploidy", type=int, default=2, choices=[1, 2],
-                        help="Ploidy: 1 for haploid, 2 for diploid (default: 2)")
-    parser.add_argument("--threads", type=int, default=1,
-                        help="Number of threads (not used in DBSCAN, kept for compatibility)")
-    parser.add_argument("--length_threshold", type=int, default=50,
-                        help="Length threshold to split short/long sequences (bp)")
-    parser.add_argument("--eps_short", type=float, default=0.5,
-                        help="DBSCAN eps for short sequences (< threshold)")
-    parser.add_argument("--eps_long", type=float, default=0.3,
-                        help="DBSCAN eps for long sequences (>= threshold)")
-    parser.add_argument("--batch_size", type=int, default=1000,
-                        help="Progress reporting interval")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input_vcf", required=True)
+    ap.add_argument("--output_vcf", required=True)
+    ap.add_argument("--new_cluster_file", required=True)
+    ap.add_argument("--length_threshold", type=int, default=50)
+    ap.add_argument("--eps_short", type=float, default=0.5)
+    ap.add_argument("--eps_long", type=float, default=0.3)
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--batch_size", type=int, default=1000)
+    args = ap.parse_args()
 
-    # Check dependencies
+    # Dependency check
     try:
-        import numpy as np
-        from sklearn.cluster import DBSCAN
+        import numpy, sklearn
     except ImportError as e:
-        sys.stderr.write(f"Error: missing dependency: {e}\n")
-        sys.stderr.write("Please install: pip install numpy scikit-learn\n")
-        sys.exit(1)
+        raise SystemExit(f"Missing dependency: {e}")
 
-    # Read input
     variants, header = read_vcf(args.input_vcf)
     write_vcf_header(args.output_vcf, header)
 
-    total = len(variants)
-    all_clusters = {}
+    # Init cluster file
+    open(args.new_cluster_file, "w").close()
 
-    # Create a temporary directory for this run
-    temp_dir = tempfile.mkdtemp(prefix="PanSVmerger_jaccard_")
-    try:
-        for idx, variant in enumerate(variants):
-            chrom, pos, vid, ref, alts, info, fmt, genotypes = variant
+    futures = {}
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        for idx, var in enumerate(variants):
             if idx % args.batch_size == 0:
-                sys.stderr.write(f"Processing {idx}/{total} variants...\n")
+                print(f"Submitted {idx}/{len(variants)} variants")
 
-            if len(alts) <= 1:
-                # No clustering needed
-                write_vcf_variant(args.output_vcf, variant)
-                all_clusters[(chrom, pos)] = {0: 0}
-                if len(alts) == 1:
-                    all_clusters[(chrom, pos)][1] = 1
+            if len(var[4]) <= 1:
+                write_vcf_variant(args.output_vcf, var)
                 continue
 
-            # Create a unique temporary FASTA file for this locus
-            fd, fasta_path = tempfile.mkstemp(suffix='.fasta', dir=temp_dir,
-                                              prefix=f"{chrom}_{pos}_")
-            os.close(fd)
-            with open(fasta_path, 'w') as f:
-                f.write(f">{chrom}-{pos}-ref\n{ref}\n")
-                for j, alt in enumerate(alts, 1):
-                    f.write(f">{chrom}-{pos}-alt{j}\n{alt}\n")
+            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".fa", delete=False)
+            write_tmp_fasta(var[0], var[1], var[3], var[4], tmp.name)
+            tmp.close()
 
+            futures[executor.submit(
+                cluster_sequences_with_length_groups,
+                tmp.name,
+                args.length_threshold,
+                args.eps_short,
+                args.eps_long
+            )] = (var, tmp.name)
+
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Clustering"):
+            var, tmp_path = futures[fut]
             try:
-                cluster_mapping, _ = cluster_sequences_with_length_groups(
-                    fasta_path,
-                    args.length_threshold,
-                    args.eps_short,
-                    args.eps_long
-                )
-
-                # Ensure all ALT alleles have a cluster
-                for alt_id in range(1, len(alts)+1):
-                    if alt_id not in cluster_mapping:
-                        max_cid = max(cluster_mapping.values(), default=0)
-                        cluster_mapping[alt_id] = max_cid + 1
-                if 0 not in cluster_mapping:
-                    cluster_mapping[0] = 0
-
-                all_clusters[(chrom, pos)] = cluster_mapping
-                updated = update_genotypes_and_ac(variant,
-                                                  {(chrom, pos): cluster_mapping},
-                                                  args.ploidy)
-                write_vcf_variant(args.output_vcf, updated)
-
+                cm, _ = fut.result()
+                save_cluster_mapping({(var[0], var[1]): cm}, args.new_cluster_file)
+                upd = update_genotypes_and_ac_with_ref_zero(var, {(var[0], var[1]): cm})
+                write_vcf_variant(args.output_vcf, upd)
             except Exception as e:
-                sys.stderr.write(f"Error at {chrom}:{pos}: {e}\n")
-                # Write original variant as fallback
-                write_vcf_variant(args.output_vcf, variant)
-
+                print(f"Error at {var[0]}:{var[1]}: {e}")
+                write_vcf_variant(args.output_vcf, var)
             finally:
-                # Remove temporary FASTA file
-                if os.path.exists(fasta_path):
-                    os.remove(fasta_path)
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
-        # Save cluster mapping
-        save_cluster_mapping(all_clusters, args.new_cluster_file)
-        sys.stderr.write(f"Done. Output VCF: {args.output_vcf}\n")
-        sys.stderr.write(f"Cluster mapping: {args.new_cluster_file}\n")
-
-    finally:
-        # Clean up temporary directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
+    print("Done.")
 
 if __name__ == "__main__":
     main()
