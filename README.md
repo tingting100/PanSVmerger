@@ -1,16 +1,23 @@
 # PanSVmerger: A Pipeline for Consolidating Multi-Allele Structural Variants
 
 ## 📖 Introduction
-**PanSVmerger** is a high-performance bioinformatics pipeline designed to refine and merge structural variant (SV) calls derived from pangenome graphs (e.g., Minigraph-Cactus). It performs (1) optional region filtering, (2) SV locus extraction by length-difference criterion, and (3) allele clustering via three strategies: k-mer adaptive Jaccard, VSEARCH global alignment, and length-based grouping.
+**PanSVmerger** is a high-performance bioinformatics pipeline designed to refine and merge structural variant (SV) calls derived from pangenome graphs (e.g., Minigraph-Cactus). 
 
+It performs three main stages:
+Regional filtering​ (optional, restrict to regions of interest)
+SV locus extraction​ (select loci where any ALT differs from REF by ≥50 bp)
+Intra-locus allele clustering​ via three strategies:
+Strategy A: k-mer-based adaptive Jaccard clustering
+Strategy B: VSEARCH global-alignment clustering
+Strategy C: length-based grouping
 ---
 
 ## 🛠 Prerequisites
 
 ### Software Dependencies
-- [vcflib](https://github.com/vcflib/vcflib) (for `vcfwave` and `vcfcreatemulti`)
-- [bcftools](https://github.com/samtools/bcftools)
-- [vsearch](https://github.com/torognes/vsearch) (required for Strategy B)
+- [vcflib >= 1.0.3](https://github.com/vcflib/vcflib) (for `vcfwave` and `vcfcreatemulti`)
+- [bcftools >= 1.18](https://github.com/samtools/bcftools)
+- [vsearch >= 2.22.1](https://github.com/torognes/vsearch) (required for Strategy B)
 
 ### Python Environment
 - Python 3.8+
