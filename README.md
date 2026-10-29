@@ -1,9 +1,7 @@
 # PanSVmerger: A Pipeline for Consolidating Multi-Allele Structural Variants
 
 ## 📖 Introduction
-**PanSVmerger** is a high-performance bioinformatics pipeline designed to refine and merge structural variant (SV) calls derived from pangenome graphs (e.g., Minigraph-Cactus). 
-
-Structural variants extracted from graph bubbles often contain redundant, nested, or slightly divergent alleles due to sequencing errors, alignment artifacts, or graph complexity. PanSVmerger addresses these challenges by implementing a three-stage workflow: **Decomposition**, **Biological Region Filtering**, and **Intelligent Allele Clustering**. It aims to provide a clean, non-redundant consensus VCF suitable for downstream population genetics and comparative genomics.
+**PanSVmerger** is a high-performance bioinformatics pipeline designed to refine and merge structural variant (SV) calls derived from pangenome graphs (e.g., Minigraph-Cactus). It performs (1) optional region filtering, (2) SV locus extraction by length-difference criterion, and (3) allele clustering via three strategies: k-mer adaptive Jaccard, VSEARCH global alignment, and length-based grouping.
 
 ---
 
