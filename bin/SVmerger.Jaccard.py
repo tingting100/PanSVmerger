@@ -4,6 +4,8 @@ SV.merge.jaccard.py
 - Parallel DBSCAN clustering
 - Short alleles: k-mer similarity only
 - Long alleles: Jaccard + length penalty
+- Adaptive alpha: weight of the length term is derived from the length
+  variability of the alleles at each locus (alpha = 1 / (1 + lambda * CV))
 """
 
 import os
@@ -67,6 +69,49 @@ def save_cluster_mapping(cluster_mapping, out):
                 f.write(f"{chrom}\t{pos}\t{alt_id}\t{cid}\n")
 
 # =========================
+# Adaptive alpha (Eq. 2)
+# =========================
+def coefficient_of_variation(lengths, ddof=0):
+    """
+    Coefficient of variation of the allele lengths at a locus:
+        CV = std(length) / mean(length)
+    ddof=0 (population standard deviation) is the default.
+    """
+    n = len(lengths)
+    if n == 0:
+        return 0.0
+    mean = sum(lengths) / n
+    if mean <= 0:
+        return 0.0
+    if ddof and n - ddof <= 0:
+        return 0.0
+    denom = n - ddof if ddof else n
+    var = sum((l - mean) ** 2 for l in lengths) / denom
+    return (var ** 0.5) / mean
+
+
+def auto_alpha_by_length_std(lengths, lambda_param=2.5, ddof=0):
+    """
+    Adaptive weighting parameter alpha (Eq. 2):
+
+        alpha = 1 / (1 + lambda * CV),  CV = std(length) / mean(length)
+
+    alpha controls how much the normalized length difference contributes to
+    the combined distance. Loci whose alleles have similar lengths (small CV)
+    give alpha close to 1, so the distance is dominated by k-mer similarity;
+    loci with dispersed lengths give a smaller alpha, so the length term
+    gains weight. Locus with fewer than two alleles or zero mean length
+    fall back to alpha = 0.5.
+    """
+    if len(lengths) < 2:
+        return 0.5
+    cv = coefficient_of_variation(lengths, ddof)
+    if cv is None:
+        return 0.5
+    return 1.0 / (1.0 + lambda_param * cv)
+
+
+# =========================
 # Distance functions
 # =========================
 def calculate_distance(seq1, seq2, use_length_penalty=True, alpha=0.7):
@@ -109,7 +154,17 @@ def calculate_distance(seq1, seq2, use_length_penalty=True, alpha=0.7):
 # =========================
 # Clustering core
 # =========================
-def cluster_by_length_group(sequences, seq_ids, length_threshold, eps_short, eps_long):
+def cluster_by_length_group(sequences, seq_ids, length_threshold, eps_short, eps_long,
+                             alpha=0.7):
+    """
+    Cluster the alleles of one locus.
+
+    alpha is the adaptive weighting parameter of Eq. 2: it controls how much
+    the normalized length difference contributes to the combined distance of
+    the long alleles. It is computed once per locus from the length
+    variability of all alleles at that locus and shared by the short and the
+    long group.
+    """
     short_idx = [i for i, s in enumerate(sequences) if len(s) < length_threshold]
     long_idx = [i for i, s in enumerate(sequences) if len(s) >= length_threshold]
 
@@ -134,7 +189,7 @@ def cluster_by_length_group(sequences, seq_ids, length_threshold, eps_short, eps
     elif len(short_idx) == 1:
         cluster[short_idx[0]] = 0
 
-    # ---- Long: Jaccard + length ----
+    # ---- Long: Jaccard + length (adaptive alpha) ----
     if len(long_idx) > 1:
         n = len(long_idx)
         D = np.zeros((n, n))
@@ -143,7 +198,8 @@ def cluster_by_length_group(sequences, seq_ids, length_threshold, eps_short, eps
                 D[i, j] = D[j, i] = calculate_distance(
                     sequences[long_idx[i]],
                     sequences[long_idx[j]],
-                    use_length_penalty=True
+                    use_length_penalty=True,
+                    alpha=alpha
                 )
         labels = DBSCAN(eps=eps_long, min_samples=1, metric="precomputed").fit_predict(D)
         if -1 in labels:
@@ -156,7 +212,17 @@ def cluster_by_length_group(sequences, seq_ids, length_threshold, eps_short, eps
 
     return cluster
 
-def cluster_sequences_with_length_groups(fasta, length_threshold, eps_short, eps_long):
+def cluster_sequences_with_length_groups(fasta, length_threshold, eps_short, eps_long,
+                                         lambda_param=2.5, alpha_fixed=None,
+                                         cv_ddof=0, cv_include_ref=True):
+    """
+    Cluster the alleles of one locus.
+
+    The adaptive alpha of Eq. 2 is computed from the allele lengths at this
+    locus (all alleles including REF unless cv_include_ref is False); the
+    population standard deviation is used by default.
+    Returns (alt_id -> cluster_id mapping, info dict with cv and alpha).
+    """
     seqs, ids = [], []
     with open(fasta) as f:
         s, sid = "", ""
@@ -175,7 +241,19 @@ def cluster_sequences_with_length_groups(fasta, length_threshold, eps_short, eps
             ids.append(sid)
 
     ref_idx = next(i for i, sid in enumerate(ids) if "ref" in sid.lower())
-    cm = cluster_by_length_group(seqs, ids, length_threshold, eps_short, eps_long)
+
+    # ---- Adaptive alpha (Eq. 2) ----
+    lengths = [len(s) for s in seqs]
+    if not cv_include_ref:
+        lengths = [len(s) for i, s in enumerate(seqs) if i != ref_idx]
+    cv = coefficient_of_variation(lengths, cv_ddof)
+    if alpha_fixed is not None:
+        alpha = alpha_fixed
+    else:
+        alpha = auto_alpha_by_length_std(lengths, lambda_param, cv_ddof)
+
+    cm = cluster_by_length_group(seqs, ids, length_threshold, eps_short, eps_long,
+                                 alpha=alpha)
 
     # ---- Force REF cluster = 0 ----
     ref_cid = cm[ref_idx]
@@ -198,7 +276,7 @@ def cluster_sequences_with_length_groups(fasta, length_threshold, eps_short, eps
         elif "alt" in sid.lower():
             alt_id = int(sid.split("alt")[-1])
             id2c[alt_id] = cm[i]
-    return id2c, {}
+    return id2c, {"cv": cv, "alpha": alpha}
 
 # =========================
 # VCF update
@@ -311,6 +389,21 @@ def main():
     ap.add_argument("--length_threshold", type=int, default=50)
     ap.add_argument("--eps_short", type=float, default=0.5)
     ap.add_argument("--eps_long", type=float, default=0.3)
+    ap.add_argument("--lambda_param", type=float, default=2.5,
+                    help="Lambda scaling factor of the adaptive alpha (Eq. 2)")
+    ap.add_argument("--alpha_fixed", type=float, default=None,
+                    help="Use a constant alpha instead of the adaptive Eq. 2 value")
+    ap.add_argument("--cv_ddof", type=int, choices=[0, 1], default=0,
+                    help="Standard deviation for the CV of Eq. 2: 0 = population, "
+                         "1 = sample (default: 0)")
+    ap.add_argument("--cv_include_ref", dest="cv_include_ref",
+                    action="store_true", default=True,
+                    help="Include the REF sequence in the CV computation (default)")
+    ap.add_argument("--no_cv_include_ref", dest="cv_include_ref",
+                    action="store_false",
+                    help="Exclude the REF sequence from the CV computation")
+    ap.add_argument("--alpha_log", default=None,
+                    help="Optional file recording the per-locus CV and alpha values")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--batch_size", type=int, default=1000)
     args = ap.parse_args()
@@ -326,6 +419,9 @@ def main():
 
     # Init cluster file
     open(args.new_cluster_file, "w").close()
+    alpha_log = open(args.alpha_log, "w") if args.alpha_log else None
+    if alpha_log:
+        alpha_log.write("chrom\tpos\tn_alleles\tcv\talpha\n")
 
     futures = {}
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
@@ -346,14 +442,21 @@ def main():
                 tmp.name,
                 args.length_threshold,
                 args.eps_short,
-                args.eps_long
+                args.eps_long,
+                args.lambda_param,
+                args.alpha_fixed,
+                args.cv_ddof,
+                args.cv_include_ref
             )] = (var, tmp.name)
 
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Clustering"):
             var, tmp_path = futures[fut]
             try:
-                cm, _ = fut.result()
+                cm, info = fut.result()
                 save_cluster_mapping({(var[0], var[1]): cm}, args.new_cluster_file)
+                if alpha_log:
+                    alpha_log.write(f"{var[0]}\t{var[1]}\t{len(var[4]) + 1}\t"
+                                    f"{info['cv']:.6f}\t{info['alpha']:.6f}\n")
                 upd = update_genotypes_and_ac_with_ref_zero(var, {(var[0], var[1]): cm})
                 write_vcf_variant(args.output_vcf, upd)
             except Exception as e:
@@ -363,8 +466,10 @@ def main():
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
 
+    if alpha_log:
+        alpha_log.close()
+
     print("Done.")
 
 if __name__ == "__main__":
     main()
-
