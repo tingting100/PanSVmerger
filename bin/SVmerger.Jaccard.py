@@ -1,355 +1,369 @@
+#!/usr/bin/env python3.9
+"""
+SV.merge.jaccard.py
+- Parallel DBSCAN clustering
+- Short alleles: k-mer similarity only
+- Long alleles: Jaccard + length penalty
+"""
+
 import os
 import argparse
+import tempfile
+import gzip
 import numpy as np
-from collections import Counter
+from collections import Counter, defaultdict
+from sklearn.cluster import DBSCAN
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from sklearn.cluster import DBSCAN
-import pysam
 
-def read_vcf(vcf_file):
-    """Read VCF file and return variants list and header"""
-    variants = []
-    vcf = pysam.VariantFile(vcf_file)
-    
-    header = vcf.header
-    
-    for record in vcf:
-        variants.append((
-            record.chrom,
-            record.pos,
-            record.ref,
-            record.alts if record.alts else [],
-            record
-        ))
-    
-    vcf.close()
+# =========================
+# VCF I/O
+# =========================
+def read_vcf(path):
+    variants, header = [], []
+    opener = gzip.open if path.endswith(".gz") else open
+    mode = "rt" if path.endswith(".gz") else "r"
+    with opener(path, mode) as f:
+        for line in f:
+            if line.startswith("##"):
+                header.append(line.rstrip().split("\t"))
+            elif line.startswith("#CHROM"):
+                header.append(line.rstrip().split("\t"))
+            else:
+                fld = line.rstrip().split("\t")
+                chrom, pos = fld[0], int(fld[1])
+                vid, ref, info, fmt = fld[2], fld[3], fld[7], fld[8]
+                alts = [] if fld[4] == "." else fld[4].split(",")
+                gts = fld[9:]
+                variants.append((chrom, pos, vid, ref, alts, info, fmt, gts))
     return variants, header
 
-def write_tmp_fasta(chrom, pos, ref, alts, tmp_filepath):
-    """Write sequences to temporary FASTA file"""
-    os.makedirs(os.path.dirname(tmp_filepath), exist_ok=True)
-    with open(tmp_filepath, 'w') as f:
-        # Write REF sequence
-        f.write(f">REF_{chrom}_{pos}\n")
-        f.write(f"{ref}\n")
-        
-        # Write ALT sequences
-        for i, alt in enumerate(alts):
-            f.write(f">ALT{i}_{chrom}_{pos}\n")
-            f.write(f"{alt}\n")
+def write_tmp_fasta(chrom, pos, ref, alts, path):
+    with open(path, "w") as f:
+        f.write(f">{chrom}-{pos}-ref\n{ref}\n")
+        for i, alt in enumerate(alts, 1):
+            f.write(f">{chrom}-{pos}-alt{i}\n{alt}\n")
 
-def get_kmer_count_vector(seq, k):
-    """Get kmer count vector for a sequence"""
-    counts = Counter()
-    for i in range(len(seq) - k + 1):
-        counts[seq[i:i + k]] += 1
-    return counts
+def write_vcf_header(path, header):
+    with open(path, "w") as f:
+        for line in header:
+            f.write("\t".join(line) + "\n")
 
-def auto_alpha_by_length_std(sequences, lambda_param=2.5):
-    """Automatically calculate alpha parameter based on length standard deviation"""
-    lengths = [len(seq) for seq in sequences]
-    if len(lengths) < 2:
-        return 0.5
-    std = np.std(lengths)
-    mean_len = np.mean(lengths)
-    return 1 / (1 + lambda_param * (std / mean_len)) if mean_len != 0 else 0.5
+def write_vcf_variant(path, var):
+    chrom, pos, vid, ref, alts, info, fmt, gts = var
+    alts_str = ",".join(alts) if alts else "."
+    gts_str = "\t".join(gts)
+    with open(path, "a") as f:
+        f.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{alts_str}\t.\t.\t{info}\t{fmt}\t{gts_str}\n")
 
-def compute_weighted_distance_matrix(sequences, alpha, k):
-    """Compute weighted distance matrix"""
-    n = len(sequences)
-    kmer_counts = [get_kmer_count_vector(seq, k) if len(seq) >= k else Counter() for seq in sequences]
-    all_kmers = sorted(set(k for c in kmer_counts for k in c))
-    kmer_index = {kmer: i for i, kmer in enumerate(all_kmers)}
+# =========================
+# Cluster mapping (APPEND)
+# =========================
+def save_cluster_mapping(cluster_mapping, out):
+    """Append all loci, never overwrite."""
+    with open(out, "a") as f:
+        for (chrom, pos), m in cluster_mapping.items():
+            for alt_id, cid in m.items():
+                f.write(f"{chrom}\t{pos}\t{alt_id}\t{cid}\n")
 
-    freq_matrix = np.zeros((n, len(all_kmers)))
-    for i, counts in enumerate(kmer_counts):
-        total = sum(counts.values())
-        for kmer, cnt in counts.items():
-            freq_matrix[i][kmer_index[kmer]] = cnt / total if total != 0 else 0.0
+# =========================
+# Distance functions
+# =========================
+def calculate_distance(seq1, seq2, use_length_penalty=True, alpha=0.7):
+    """
+    Calculate distance between two sequences.
+    - Short: Jaccard only (use_length_penalty=False)
+    - Long: Jaccard + length penalty (use_length_penalty=True)
+    """
+    if not seq1 or not seq2:
+        return 1.0
 
-    matrix = np.zeros((n, n))
-    for i in range(n):
-        for j in range(i + 1, n):
-            len_i, len_j = len(sequences[i]), len(sequences[j])
-            len_diff = abs(len_i - len_j) / max(len_i, len_j) if max(len_i, len_j) != 0 else 0.0
-            i_short, j_short = len_i < k, len_j < k
+    l1, l2 = len(seq1), len(seq2)
+    min_len = min(l1, l2)
 
-            if not i_short and not j_short:
-                min_sum = np.minimum(freq_matrix[i], freq_matrix[j]).sum()
-                max_sum = np.maximum(freq_matrix[i], freq_matrix[j]).sum()
-                jaccard = 1.0 - (min_sum / max_sum if max_sum != 0 else 0.0)
-            elif i_short and j_short:
-                jaccard = 0.0
-            else:
-                long_seq = sequences[j] if i_short else sequences[i]
-                jaccard = 0.0 if len(long_seq) < 50 else 1.0
-
-            matrix[i][j] = matrix[j][i] = alpha * jaccard + (1 - alpha) * len_diff
-    return matrix
-
-def reassign_noise_labels(labels):
-    """Reassign noise labels"""
-    labels = np.array(labels)
-    if len(labels) == 0:
-        return labels
-    max_label = labels[labels != -1].max() if np.any(labels != -1) else -1
-    next_label = max_label + 1
-    for i in range(len(labels)):
-        if labels[i] == -1:
-            labels[i] = next_label
-            next_label += 1
-    return labels
-
-def process_one_position(chrom, pos, ref, alts, k, eps, lambda_param, tmp_filepath):
-    """Process one genomic position using temporary FASTA file"""
-    # 写入序列到临时文件
-    write_tmp_fasta(chrom, pos, ref, alts, tmp_filepath)
-    
-    # 从临时文件读取序列
-    sequences = []
-    seq_ids = []
-    
-    with open(tmp_filepath) as f:
-        current_seq = ''
-        for line in f:
-            if line.startswith('>'):
-                if current_seq:
-                    sequences.append(current_seq)
-                seq_ids.append(line.strip()[1:])
-                current_seq = ''
-            else:
-                current_seq += line.strip()
-        if current_seq:
-            sequences.append(current_seq)
-    
-    # 执行聚类
-    alpha = auto_alpha_by_length_std(sequences, lambda_param)
-    dist_matrix = compute_weighted_distance_matrix(sequences, alpha, k)
-    
-    # 处理特殊情况：所有序列太短或距离矩阵全零
-    if np.all(dist_matrix == 0):
-        # 为每个序列分配唯一标签
-        labels = list(range(len(sequences)))
+    # adaptive k
+    if min_len <= 5:
+        k = 1
+    elif min_len <= 10:
+        k = 2
+    elif min_len <= 20:
+        k = 3
     else:
-        dbscan = DBSCAN(eps=eps, min_samples=1, metric='precomputed')
-        labels = dbscan.fit_predict(dist_matrix)
-        labels = reassign_noise_labels(labels)
-    
-    # 确保REF序列在cluster 0
-    ref_id = f"REF_{chrom}_{pos}"
-    ref_idx = seq_ids.index(ref_id)
-    ref_label = labels[ref_idx]
-    if ref_label != 0:
-        # 交换标签
-        labels[labels == 0] = ref_label
-        labels[labels == ref_label] = 0
-    
-    # 构建聚类结果
-    clusters = {}
-    for seq_id, label in zip(seq_ids, labels):
-        clusters[seq_id] = int(label)
-    
-    return {
-        "chrom": chrom,
-        "pos": pos,
-        "clusters": clusters
-    }
+        k = 5
 
-def update_genotypes(variants, clustering_results):
-    """Update genotype information based on clustering"""
-    updated_variants = []
-    
-    for chrom, pos, ref, alts, record in variants:
-        if (chrom, pos) not in clustering_results:
-            updated_variants.append(record)
-            continue
-        
-        clusters = clustering_results[(chrom, pos)]["clusters"]
-        ref_cluster = clusters.get(f"REF_{chrom}_{pos}", 0)
-        
-        unique_clusters = set(clusters.values())
-        if len(unique_clusters) <= 1:
-            # 只有一种等位基因，跳过该位点
-            updated_variants.append(record)
-            continue
- 
-        # Build cluster to genotype mapping
-        cluster_to_gt = {ref_cluster: 0}
-        next_gt = 1
-        
-        # Process ALTs
-        new_alts = []
-        alt_to_gt = {}
-        cluster_representatives = {}
+    s1 = {seq1[i:i+k] for i in range(l1 - k + 1)}
+    s2 = {seq2[i:i+k] for i in range(l2 - k + 1)}
+    if not s1 or not s2:
+        return 1.0
 
-        for i, alt in enumerate(alts):
-            alt_key = f"ALT{i}_{chrom}_{pos}"
-            cluster_id = clusters.get(alt_key, ref_cluster)
-            
-            if cluster_id not in cluster_to_gt:
-                if cluster_id != ref_cluster:  # New cluster gets new genotype
-                    cluster_to_gt[cluster_id] = next_gt
-                    next_gt += 1
-            
-            # Record ALT to genotype mapping
-            gt = cluster_to_gt[cluster_id]
-            alt_to_gt[i] = gt
-            
-            # Keep only representative ALTs (first ALT per cluster)
-            if gt != 0 and cluster_id not in cluster_representatives:
-                cluster_representatives[cluster_id] = alt
-                new_alts.append(alt)
-        
-        # Update genotypes
-        for sample in record.samples:
-            gt = record.samples[sample]["GT"]
-            if gt is None:
+    inter = len(s1 & s2)
+    union = len(s1 | s2)
+    jaccard = 1.0 - inter / union if union else 1.0
+
+    if not use_length_penalty:
+        return jaccard
+
+    length_diff = abs(l1 - l2) / max(l1, l2)
+    return alpha * jaccard + (1 - alpha) * length_diff
+
+# =========================
+# Clustering core
+# =========================
+def cluster_by_length_group(sequences, seq_ids, length_threshold, eps_short, eps_long):
+    short_idx = [i for i, s in enumerate(sequences) if len(s) < length_threshold]
+    long_idx = [i for i, s in enumerate(sequences) if len(s) >= length_threshold]
+
+    cluster = {}
+
+    # ---- Short: k-mer ONLY ----
+    if len(short_idx) > 1:
+        n = len(short_idx)
+        D = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                D[i, j] = D[j, i] = calculate_distance(
+                    sequences[short_idx[i]],
+                    sequences[short_idx[j]],
+                    use_length_penalty=False
+                )
+        labels = DBSCAN(eps=eps_short, min_samples=1, metric="precomputed").fit_predict(D)
+        if -1 in labels:
+            labels = np.zeros(n, dtype=int)
+        for i, sid in enumerate(short_idx):
+            cluster[sid] = labels[i]
+    elif len(short_idx) == 1:
+        cluster[short_idx[0]] = 0
+
+    # ---- Long: Jaccard + length ----
+    if len(long_idx) > 1:
+        n = len(long_idx)
+        D = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                D[i, j] = D[j, i] = calculate_distance(
+                    sequences[long_idx[i]],
+                    sequences[long_idx[j]],
+                    use_length_penalty=True
+                )
+        labels = DBSCAN(eps=eps_long, min_samples=1, metric="precomputed").fit_predict(D)
+        if -1 in labels:
+            labels = np.zeros(n, dtype=int)
+        offset = len(set(cluster.values()))
+        for i, sid in enumerate(long_idx):
+            cluster[sid] = labels[i] + offset
+    elif len(long_idx) == 1:
+        cluster[long_idx[0]] = len(set(cluster.values()))
+
+    return cluster
+
+def cluster_sequences_with_length_groups(fasta, length_threshold, eps_short, eps_long):
+    seqs, ids = [], []
+    with open(fasta) as f:
+        s, sid = "", ""
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                if sid:
+                    seqs.append(s)
+                    ids.append(sid)
+                sid = line[1:]
+                s = ""
+            else:
+                s += line
+        if sid:
+            seqs.append(s)
+            ids.append(sid)
+
+    ref_idx = next(i for i, sid in enumerate(ids) if "ref" in sid.lower())
+    cm = cluster_by_length_group(seqs, ids, length_threshold, eps_short, eps_long)
+
+    # ---- Force REF cluster = 0 ----
+    ref_cid = cm[ref_idx]
+    if ref_cid != 0:
+        zero_keys = [k for k, v in cm.items() if v == 0]
+        ref_keys = [k for k, v in cm.items() if v == ref_cid]
+        for k in zero_keys:
+            cm[k] = ref_cid
+        for k in ref_keys:
+            cm[k] = 0
+
+    uni = sorted(set(cm.values()))
+    remap = {o: n for n, o in enumerate(uni)}
+    cm = {k: remap[v] for k, v in cm.items()}
+
+    id2c = {}
+    for i, sid in enumerate(ids):
+        if "ref" in sid.lower():
+            id2c[0] = cm[i]
+        elif "alt" in sid.lower():
+            alt_id = int(sid.split("alt")[-1])
+            id2c[alt_id] = cm[i]
+    return id2c, {}
+
+# =========================
+# VCF update
+# =========================
+def ensure_ref_and_alts_in_clusters(variant, clusters):
+    chrom, pos, _, ref, alts, _, _, _ = variant
+    if (chrom, pos) not in clusters:
+        clusters[(chrom, pos)] = {}
+    if 0 not in clusters[(chrom, pos)]:
+        clusters[(chrom, pos)][0] = 0
+    mx = max(clusters[(chrom, pos)].values(), default=0)
+    for i in range(1, len(alts) + 1):
+        if i not in clusters[(chrom, pos)]:
+            mx += 1
+            clusters[(chrom, pos)][i] = mx
+    return clusters
+
+def update_genotypes_and_ac_with_ref_zero(variant, clusters):
+    chrom, pos, vid, ref, alts, info, fmt, gts = variant
+    clusters = ensure_ref_and_alts_in_clusters(variant, clusters)
+    cm = clusters[(chrom, pos)]
+
+    ref_cid = cm[0]
+    gt_map = {ref_cid: 0}
+    nxt = 1
+    for cid in sorted(set(cm.values())):
+        if cid != ref_cid:
+            gt_map[cid] = nxt
+            nxt += 1
+
+    new_gts, ac = [], Counter()
+    for gt in gts:
+        if gt in (".", "./.", ".|."):
+            new_gts.append(gt)
+            continue
+        sep = "|" if "|" in gt else "/"
+        als = gt.split(sep)
+        new_a = []
+        for a in als:
+            if a == ".":
+                new_a.append(".")
                 continue
-            
-            new_gt = []
-            for allele in gt:
-                if allele is None:
-                    new_gt.append(None)
-                elif allele == 0:
-                    new_gt.append(0)
-                else:
-                    new_gt.append(alt_to_gt.get(allele - 1, 0))
-            
-            record.samples[sample]["GT"] = tuple(new_gt)
-        
-        # Update ALT list
-        record.alts = tuple(new_alts)
-        updated_variants.append(record)
-    
-    return updated_variants
+            oa = int(a)
+            if oa in cm:
+                cid = cm[oa]
+                ng = gt_map[cid]
+                new_a.append(str(ng))
+                if ng != 0:
+                    ac[ng] += 1
+            else:
+                new_a.append(a)
+        new_gts.append(sep.join(new_a))
 
-def cleanup_temp_dirs(tmp_dir):
-    """Clean up empty chromosome directories after all processing is done"""
-    if os.path.exists(tmp_dir):
-        # 遍历临时目录中的所有染色体目录
-        for chrom_dir in os.listdir(tmp_dir):
-            chrom_dir_path = os.path.join(tmp_dir, chrom_dir)
-            if os.path.isdir(chrom_dir_path):
-                # 检查染色体目录是否为空
-                if not os.listdir(chrom_dir_path):
-                    try:
-                        os.rmdir(chrom_dir_path)
-                        print(f"Removed empty directory: {chrom_dir_path}")
-                    except OSError as e:
-                        print(f"Warning: Could not remove directory {chrom_dir_path}: {e}")
-                else:
-                    print(f"Directory {chrom_dir_path} is not empty, keeping it.")
-        
-        # 检查主临时目录是否为空
-        if not os.listdir(tmp_dir):
-            try:
-                os.rmdir(tmp_dir)
-                print(f"Removed empty temporary directory: {tmp_dir}")
-            except OSError as e:
-                print(f"Warning: Could not remove temporary directory {tmp_dir}: {e}")
+    clu_seqs = defaultdict(list)
+    for aid, cid in cm.items():
+        if aid > 0 and aid - 1 < len(alts):
+            clu_seqs[cid].append(alts[aid - 1])
+
+    new_alts = []
+    for gid in sorted(gt_map.values()):
+        if gid == 0:
+            continue
+        for cid, g in gt_map.items():
+            if g == gid and cid in clu_seqs:
+                new_alts.append(max(clu_seqs[cid], key=len))
+                break
+
+    # ---- Parse INFO ----
+    infod = {}
+    for x in info.split(";"):
+        if "=" in x:
+            k, v = x.split("=", 1)
+            infod[k] = v
         else:
-            print(f"Temporary directory {tmp_dir} is not empty, keeping it.")
+            infod[x] = None
 
-def write_output_vcf(output_file, header, variants):
-    """Write the output VCF file"""
-    with pysam.VariantFile(output_file, 'w', header=header) as out_vcf:
-        for variant in variants:
-            out_vcf.write(variant)
+    # ---- Calculate AN ----
+    an = 0
+    for gt in gts:
+        if gt not in (".", "./.", ".|."):
+            sep = "|" if "|" in gt else "/"
+            for a in gt.split(sep):
+                if a != ".":
+                    an += 1
 
+    # ---- Update AC, AN, AF ----
+    infod["AC"] = ",".join(str(ac.get(i, 0)) for i in range(1, len(new_alts) + 1))
+    infod["AN"] = str(an)
+    af_vals = []
+    for i in range(1, len(new_alts) + 1):
+        if an > 0:
+            af_vals.append(f"{ac.get(i, 0) / an:.6f}")
+        else:
+            af_vals.append("0.000000")
+    infod["AF"] = ",".join(af_vals)
 
+    # ---- Rebuild INFO ----
+    new_info = ";".join(f"{k}={v}" if v is not None else k for k, v in infod.items())
+
+    return (chrom, pos, vid, ref, new_alts, new_info, fmt, new_gts)
+
+# =========================
+# Main
+# =========================
 def main():
-    parser = argparse.ArgumentParser(description="SV sequence clustering and genotype updating")
-    parser.add_argument("--input", required=True, help="Input VCF file")
-    parser.add_argument("--output", required=True, help="Output VCF file")
-    parser.add_argument("--k", type=int, default=5, help="k-mer size")
-    parser.add_argument("--eps", type=float, default=0.5, help="DBSCAN eps parameter")
-    parser.add_argument("--lambda", type=float, default=2.5, dest="lambda_param", help="Lambda parameter for alpha calculation")
-    parser.add_argument("--threads", type=int, default=4, help="Number of threads")
-    parser.add_argument("--tmp_dir", default="tmp_cluster_files", help="Temporary dir for clustering (optional)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input_vcf", required=True)
+    ap.add_argument("--output_vcf", required=True)
+    ap.add_argument("--new_cluster_file", required=True)
+    ap.add_argument("--length_threshold", type=int, default=50)
+    ap.add_argument("--eps_short", type=float, default=0.5)
+    ap.add_argument("--eps_long", type=float, default=0.3)
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--batch_size", type=int, default=1000)
+    args = ap.parse_args()
 
-    args = parser.parse_args()
-
-    # 创建临时目录
-    os.makedirs(args.tmp_dir, exist_ok=True)
-
-    # Read VCF
-    variants, header = read_vcf(args.input)
-    
-    # Pre-filter variants
-    variants_to_process = []
-    clustering_results = {}
-    
-    # First pass: handle simple cases (single ALT) directly
-    for variant in variants:
-        chrom, pos, ref, alts, record = variant
-        if len(alts) <= 1:
-            clusters = {"REF": 0}
-            if len(alts) == 1:
-                clusters[f"ALT0_{chrom}_{pos}"] = 1
-            clustering_results[(chrom, pos)] = {
-                "chrom": chrom,
-                "pos": pos,
-                "clusters": clusters
-            }
-        else:
-            variants_to_process.append((chrom, pos, ref, alts, record))
-
-    # Second pass: process variants with multiple ALTs
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        futures = {}
-        for chrom, pos, ref, alts, record in variants_to_process:
-            # 生成临时文件名：tmp_dir/chr_pos.fa
-            tmp_filename = os.path.join(args.tmp_dir, f"{chrom}_{pos}.fa")
-            
-            future = executor.submit(
-                process_one_position, 
-                chrom, pos, ref, alts, 
-                args.k, args.eps, args.lambda_param,
-                tmp_filename  # 传递临时文件路径
-            )
-            futures[future] = (chrom, pos, tmp_filename)
-        
-        # 处理结果并清理临时文件
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing variants"):
-            chrom, pos, tmp_filename = futures[future]
-            try:
-                result = future.result()
-                clustering_results[(chrom, pos)] = result
-            except Exception as e:
-                print(f"Error processing {chrom}:{pos}: {e}")
-                # 出错时返回默认聚类结果
-                clusters = {"REF": 0}
-                for i in range(len(alts)):
-                    clusters[f"ALT{i}_{chrom}_{pos}"] = i + 1
-                clustering_results[(chrom, pos)] = {
-                    "chrom": chrom,
-                    "pos": pos,
-                    "clusters": clusters
-                }
-            finally:
-                # 删除临时文件
-                if os.path.exists(tmp_filename):
-                    try:
-                        os.remove(tmp_filename)
-                    except Exception as e:
-                        print(f"Warning: Could not delete {tmp_filename}: {e}")
-
-    # 清理临时目录（如果为空）
+    # Dependency check
     try:
-        if not os.listdir(args.tmp_dir):
-            os.rmdir(args.tmp_dir)
-            print(f"Temporary directory '{args.tmp_dir}' removed.")
-    except OSError:
-        print(f"Temporary directory '{args.tmp_dir}' is not empty, keeping it.")
-    
-    # Update genotypes and write output
-    print("Updating genotypes...")
-    updated_variants = update_genotypes(variants, clustering_results)
-    
-    print("Writing output VCF...")
-    write_output_vcf(args.output, header, updated_variants)
-    print("Processing completed!")
+        import numpy, sklearn
+    except ImportError as e:
+        raise SystemExit(f"Missing dependency: {e}")
+
+    variants, header = read_vcf(args.input_vcf)
+    write_vcf_header(args.output_vcf, header)
+
+    # Init cluster file
+    open(args.new_cluster_file, "w").close()
+
+    futures = {}
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        for idx, var in enumerate(variants):
+            if idx % args.batch_size == 0:
+                print(f"Submitted {idx}/{len(variants)} variants")
+
+            if len(var[4]) <= 1:
+                write_vcf_variant(args.output_vcf, var)
+                continue
+
+            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".fa", delete=False)
+            write_tmp_fasta(var[0], var[1], var[3], var[4], tmp.name)
+            tmp.close()
+
+            futures[executor.submit(
+                cluster_sequences_with_length_groups,
+                tmp.name,
+                args.length_threshold,
+                args.eps_short,
+                args.eps_long
+            )] = (var, tmp.name)
+
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Clustering"):
+            var, tmp_path = futures[fut]
+            try:
+                cm, _ = fut.result()
+                save_cluster_mapping({(var[0], var[1]): cm}, args.new_cluster_file)
+                upd = update_genotypes_and_ac_with_ref_zero(var, {(var[0], var[1]): cm})
+                write_vcf_variant(args.output_vcf, upd)
+            except Exception as e:
+                print(f"Error at {var[0]}:{var[1]}: {e}")
+                write_vcf_variant(args.output_vcf, var)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+    print("Done.")
 
 if __name__ == "__main__":
     main()
